@@ -4,7 +4,7 @@ import ldm_patched.modules.model_management as model_management
 
 from torchvision import transforms
 from torchvision.transforms.functional import InterpolationMode
-from modules.model_loader import load_file_from_url
+from modules.model_manifest import download as manifest_download
 from modules.config import path_clip_vision
 from ldm_patched.modules.model_patcher import ModelPatcher
 from extras.BLIP.models.blip import blip_decoder
@@ -25,10 +25,9 @@ class Interrogator:
     @torch.inference_mode()
     def interrogate(self, img_rgb):
         if self.blip_model is None:
-            filename = load_file_from_url(
-                url='https://huggingface.co/lllyasviel/misc/resolve/main/model_base_caption_capfilt_large.pth',
+            filename = manifest_download(
+                "blip-caption-base",
                 model_dir=path_clip_vision,
-                file_name='model_base_caption_capfilt_large.pth',
             )
 
             model = blip_decoder(pretrained=filename, image_size=blip_image_eval_size, vit='base',

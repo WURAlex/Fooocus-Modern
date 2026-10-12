@@ -469,16 +469,50 @@ subdirectory**, so the notebook fails at `%cd` before `launch.py` runs. It also
 performs no dependency pre-check, no GPU check, and no persistent-storage
 handling.
 
-### Stage 7 — Review model URLs and model integrity — **NOT STARTED**
+### Stage 7 — Review model URLs and model integrity — **AUDIT COMPLETE, P0 IMPLEMENTED (awaiting sign-off)**
 
-- **0 of 30** `load_file_from_url(...)` call sites pass `expected_hash`
-  (`launch.py`, `modules/config.py`, `extras/`), so every model downloads with
-  `expected_hash=None` and is accepted on size/HTTPS alone.
-- The only `hash_prefix` usage is `extras/facexlib/utils/misc.py:77` →
-  `hash_prefix=None` (and it still calls `torch.hub.download_url_to_file`,
-  bypassing the hardened downloader entirely).
-- `modules/hash_cache.py` computes SHA-256 of *local* files for UI metadata —
-  not download verification.
+Full audit: **`docs/MODEL_INTEGRITY_AUDIT.md`** (branch `stage7-model-integrity-audit`,
+baseline `c4e8986`, audit date 2026-10-12). The P0 implementation landed in the
+same worktree afterwards (uncommitted, awaiting review): new
+`models/manifest.json` + `modules/model_manifest.py`, `modules/model_loader.py`
+gained fail-closed `cached_hash_mismatch`, and all 24 fixed-artifact call sites
+now resolve through the manifest. No dependencies or notebooks changed.
+
+Audit findings (pre-P0 state, retained for history):
+
+- **32 in-repo download call sites** (correcting the earlier estimate of 30):
+  28 hardened `load_file_from_url`, 2 legacy facexlib (`torch.hub`-based),
+  1 `torch.hub.load_state_dict_from_url`, 1 dead raw-`urlopen` helper
+  (0 callers) — plus 1 dependency-internal path (rembg, 7 model files).
+  They cover **34 fixed artifact identities** and **4 user-supplied URL
+  categories**.
+- **0 of 32** call sites passed `expected_hash`; existing cached files were
+  accepted on size > 0 alone (`modules/model_loader.py:1279-1287`).
+  **After P0:** 24 fixed sites pass the manifest hash (config.py ×18,
+  launch.py ×2, extras ×4), the 4 user-URL loops enforce the hash whenever the
+  `(file_name, url)` pair matches a verified entry, and cached files with a
+  mismatched hash fail closed on manifest-driven downloads
+  (`CachedFileIntegrityError`; explicit removal required to recover). The
+  legacy facexlib/BLIP-DeiT/rembg paths remain unenforced (P1).
+- Identity status: **26 verified** (independently published SHA-256 via HF
+  LFS OIDs), **unresolved: 8 audit categories = 14 manifest entries** (the
+  rembg family is listed as 7 individual entries), **4 user-provided**
+  categories. No hash was invented; pinned HF revisions recorded in the audit.
+- **New functional defect:** `github.com` was absent from the hardened allowlist
+  (`modules/model_loader.py:28-40`), so the only hardened GitHub-release caller
+  (`extras/GroundingDINO/util/inference.py:32`) **failed closed on a fresh
+  install**. **Fixed via P0** with per-artifact
+  `allowed_domains: ["github.com", "release-assets.githubusercontent.com"]`
+  from the manifest, not a wider default (chain verified: `github.com` 302 →
+  `release-assets.githubusercontent.com`).
+- Legacy bypasses confirmed: facexlib downloads (`extras/facexlib/utils/misc.py:77`,
+  `hash_prefix=None`), BLIP/DeiT via torch.hub (prefix-only `check_hash`),
+  rembg internal downloader; dead raw-`urlopen` helper at
+  `ldm_patched/k_diffusion/utils.py:37`. **Still open (P1).**
+- Design (manifest schema, statuses `verified`/`unresolved`/
+  `user-provided`, review/authentication process, P0–P3 plan with acceptance
+  tests T1–T8) is specified in the audit doc §5 and §8; P0 results and
+  deviations are recorded in audit doc §10. **Commit requires approval.**
 
 ### Stage 8 — Review subprocess, network, and update behavior — **NOT STARTED**
 
@@ -593,7 +627,12 @@ stage has any evidence behind it.
 6. **`tests/test_utils.py` needs `numpy`** → `discover -s tests` can never be
    fully green in a clean environment (dependency installs are forbidden until
    Stage 4 is authorized).
-7. **No CI test workflow** — the 132 tests only run when someone runs them.
+7. ~~No CI test workflow~~ — **resolved**: Security CI added in PR #1 (merge
+   `c4e8986`), runs `python -m unittest tests.test_model_loader` on Python
+   3.10/3.12/3.14 with `packaging==24.1` as the only installed dependency;
+   **extended in this session** to also run `tests.test_model_integrity`
+   (same matrix; actionlint clean). `discover -s tests` still blocked by
+   `tests/test_utils`/numpy (item 6).
 
 ### 7.3 Deferred improvements (not defects of this session)
 
@@ -602,8 +641,9 @@ stage has any evidence behind it.
    them on release reintroduces a check-to-use race — documented in
    `test_lock_file_is_persistent_by_design`).
 10. `download_file` calls `fsync` on neither temp file nor directory.
-11. Stage 6 notebook, Stage 7 hashing of the 30 call sites, Stage 4 dependency
-    modernization — all untouched, as instructed.
+11. Stage 6 notebook, Stage 4 dependency modernization — untouched, as
+    instructed. Stage 7 P0 hashing **was** implemented afterwards per the
+    approved session scope (§5 Stage 7, §8 item 15); P1 bypass cleanup remains.
 
 ---
 
@@ -656,14 +696,26 @@ stage has any evidence behind it.
 
 **P1 — after Stage 2 sign-off**
 
-15. Stage 7 groundwork: build a model manifest with SHA-256 for every download
-    URL (30 call sites) and start passing `expected_hash`; route
-    `extras/facexlib/utils/misc.py` through the hardened downloader; add
+15. Stage 7 (audit in `docs/MODEL_INTEGRITY_AUDIT.md`, results in §10):
+    **P0 ✅ implemented 2026-10-12, uncommitted, awaiting approval** — landed
+    the versioned manifest (`models/manifest.json`: 40 entries = 26 verified
+    SHA-256 identities + 14 unresolved + 4 user-supplied categories), routed the
+    24 fixed-artifact call sites through `modules/model_manifest` with
+    revision-pinned URLs and `expected_hash` (2 verified preset defaults
+    enforced via `(file_name, url)` matching in the user-URL loops), fixed the
+    GroundingDINO allowlist defect with per-artifact `allowed_domains`, added
+    fail-closed cached-hash verification (`CachedFileIntegrityError`) and
+    `tests/test_model_integrity.py` (36 tests incl. post-review corrections
+    L1/L2/L3/L5 — audit §11; suite 169/169 ×3). **Still
+    pending (P1):** route `extras/facexlib/utils/misc.py` and the BLIP/DeiT
+    torch.hub path through the hardened downloader, pre-download/rehash the
+    rembg family, delete the dead `ldm_patched` raw-`urlopen` helper, add
     `fsync` before `os.replace`.
 16. Stage 8: audit `modules/launch_util.py` subprocess execution, network call
     sites, and any residual update behavior.
-17. Add a CI workflow running `python3 -m unittest discover -s tests` (after
-    deciding how `tests/test_utils.py` gets `numpy`).
+17. ~~Add a CI workflow~~ — Security CI exists since PR #1 (`tests.test_model_loader`
+    on 3.10/3.12/3.14). Extending CI to `discover -s tests` still awaits the
+    numpy decision for `tests/test_utils.py`.
 
 **P2 — after Stages 3/7/8**
 
