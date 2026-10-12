@@ -8,7 +8,7 @@ import tempfile
 import modules.flags
 import modules.sdxl_styles
 
-from modules.model_loader import load_file_from_url
+from modules.model_manifest import download as manifest_download
 from modules.extra_utils import makedirs_with_log, get_files_from_folder, try_eval_env_var
 from modules.flags import OutputFormat, Performance, MetadataScheme
 
@@ -823,83 +823,47 @@ def update_files():
 def downloading_inpaint_models(v):
     assert v in modules.flags.inpaint_engine_versions
 
-    load_file_from_url(
-        url='https://huggingface.co/lllyasviel/fooocus_inpaint/resolve/main/fooocus_inpaint_head.pth',
-        model_dir=path_inpaint,
-        file_name='fooocus_inpaint_head.pth'
-    )
+    manifest_download("fooocus-inpaint-head", model_dir=path_inpaint)
     head_file = os.path.join(path_inpaint, 'fooocus_inpaint_head.pth')
     patch_file = None
 
     if v == 'v1':
-        load_file_from_url(
-            url='https://huggingface.co/lllyasviel/fooocus_inpaint/resolve/main/inpaint.fooocus.patch',
-            model_dir=path_inpaint,
-            file_name='inpaint.fooocus.patch'
-        )
+        manifest_download("fooocus-inpaint-v1", model_dir=path_inpaint)
         patch_file = os.path.join(path_inpaint, 'inpaint.fooocus.patch')
 
     if v == 'v2.5':
-        load_file_from_url(
-            url='https://huggingface.co/lllyasviel/fooocus_inpaint/resolve/main/inpaint_v25.fooocus.patch',
-            model_dir=path_inpaint,
-            file_name='inpaint_v25.fooocus.patch'
-        )
+        manifest_download("fooocus-inpaint-v25", model_dir=path_inpaint)
         patch_file = os.path.join(path_inpaint, 'inpaint_v25.fooocus.patch')
 
     if v == 'v2.6':
-        load_file_from_url(
-            url='https://huggingface.co/lllyasviel/fooocus_inpaint/resolve/main/inpaint_v26.fooocus.patch',
-            model_dir=path_inpaint,
-            file_name='inpaint_v26.fooocus.patch'
-        )
+        manifest_download("fooocus-inpaint-v26", model_dir=path_inpaint)
         patch_file = os.path.join(path_inpaint, 'inpaint_v26.fooocus.patch')
 
     return head_file, patch_file
 
 
 def downloading_sdxl_lcm_lora():
-    load_file_from_url(
-        url='https://huggingface.co/lllyasviel/misc/resolve/main/sdxl_lcm_lora.safetensors',
-        model_dir=paths_loras[0],
-        file_name=modules.flags.PerformanceLoRA.EXTREME_SPEED.value
-    )
+    manifest_download("sdxl-lcm-lora", model_dir=paths_loras[0])
     return modules.flags.PerformanceLoRA.EXTREME_SPEED.value
 
 
 def downloading_sdxl_lightning_lora():
-    load_file_from_url(
-        url='https://huggingface.co/mashb1t/misc/resolve/main/sdxl_lightning_4step_lora.safetensors',
-        model_dir=paths_loras[0],
-        file_name=modules.flags.PerformanceLoRA.LIGHTNING.value
-    )
+    manifest_download("sdxl-lightning-lora", model_dir=paths_loras[0])
     return modules.flags.PerformanceLoRA.LIGHTNING.value
 
 
 def downloading_sdxl_hyper_sd_lora():
-    load_file_from_url(
-        url='https://huggingface.co/mashb1t/misc/resolve/main/sdxl_hyper_sd_4step_lora.safetensors',
-        model_dir=paths_loras[0],
-        file_name=modules.flags.PerformanceLoRA.HYPER_SD.value
-    )
+    manifest_download("sdxl-hyper-sd-lora", model_dir=paths_loras[0])
     return modules.flags.PerformanceLoRA.HYPER_SD.value
 
 
 def downloading_controlnet_canny():
-    load_file_from_url(
-        url='https://huggingface.co/lllyasviel/misc/resolve/main/control-lora-canny-rank128.safetensors',
-        model_dir=path_controlnet,
-        file_name='control-lora-canny-rank128.safetensors'
-    )
+    manifest_download("controlnet-canny-lora", model_dir=path_controlnet)
     return os.path.join(path_controlnet, 'control-lora-canny-rank128.safetensors')
 
 
 def downloading_controlnet_cpds():
-    load_file_from_url(
-        url='https://huggingface.co/lllyasviel/misc/resolve/main/fooocus_xl_cpds_128.safetensors',
-        model_dir=path_controlnet,
-        file_name='fooocus_xl_cpds_128.safetensors'
-    )
+    manifest_download("controlnet-cpds", model_dir=path_controlnet)
     return os.path.join(path_controlnet, 'fooocus_xl_cpds_128.safetensors')
 
 
@@ -908,53 +872,29 @@ def downloading_ip_adapters(v):
 
     results = []
 
-    load_file_from_url(
-        url='https://huggingface.co/lllyasviel/misc/resolve/main/clip_vision_vit_h.safetensors',
-        model_dir=path_clip_vision,
-        file_name='clip_vision_vit_h.safetensors'
-    )
+    manifest_download("clip-vision-vit-h", model_dir=path_clip_vision)
     results += [os.path.join(path_clip_vision, 'clip_vision_vit_h.safetensors')]
 
-    load_file_from_url(
-        url='https://huggingface.co/lllyasviel/misc/resolve/main/fooocus_ip_negative.safetensors',
-        model_dir=path_controlnet,
-        file_name='fooocus_ip_negative.safetensors'
-    )
+    manifest_download("ip-adapter-negative", model_dir=path_controlnet)
     results += [os.path.join(path_controlnet, 'fooocus_ip_negative.safetensors')]
 
     if v == 'ip':
-        load_file_from_url(
-            url='https://huggingface.co/lllyasviel/misc/resolve/main/ip-adapter-plus_sdxl_vit-h.bin',
-            model_dir=path_controlnet,
-            file_name='ip-adapter-plus_sdxl_vit-h.bin'
-        )
+        manifest_download("ip-adapter-plus-sdxl", model_dir=path_controlnet)
         results += [os.path.join(path_controlnet, 'ip-adapter-plus_sdxl_vit-h.bin')]
 
     if v == 'face':
-        load_file_from_url(
-            url='https://huggingface.co/lllyasviel/misc/resolve/main/ip-adapter-plus-face_sdxl_vit-h.bin',
-            model_dir=path_controlnet,
-            file_name='ip-adapter-plus-face_sdxl_vit-h.bin'
-        )
+        manifest_download("ip-adapter-plus-face-sdxl", model_dir=path_controlnet)
         results += [os.path.join(path_controlnet, 'ip-adapter-plus-face_sdxl_vit-h.bin')]
 
     return results
 
 
 def downloading_upscale_model():
-    load_file_from_url(
-        url='https://huggingface.co/lllyasviel/misc/resolve/main/fooocus_upscaler_s409985e5.bin',
-        model_dir=path_upscale_models,
-        file_name='fooocus_upscaler_s409985e5.bin'
-    )
+    manifest_download("fooocus-upscaler", model_dir=path_upscale_models)
     return os.path.join(path_upscale_models, 'fooocus_upscaler_s409985e5.bin')
 
 def downloading_safety_checker_model():
-    load_file_from_url(
-        url='https://huggingface.co/mashb1t/misc/resolve/main/stable-diffusion-safety-checker.bin',
-        model_dir=path_safety_checker,
-        file_name='stable-diffusion-safety-checker.bin'
-    )
+    manifest_download("sd-safety-checker", model_dir=path_safety_checker)
     return os.path.join(path_safety_checker, 'stable-diffusion-safety-checker.bin')
 
 
@@ -971,27 +911,15 @@ def download_sam_model(sam_model: str) -> str:
 
 
 def downloading_sam_vit_b():
-    load_file_from_url(
-        url='https://huggingface.co/mashb1t/misc/resolve/main/sam_vit_b_01ec64.pth',
-        model_dir=path_sam,
-        file_name='sam_vit_b_01ec64.pth'
-    )
+    manifest_download("sam-vit-b", model_dir=path_sam)
     return os.path.join(path_sam, 'sam_vit_b_01ec64.pth')
 
 
 def downloading_sam_vit_l():
-    load_file_from_url(
-        url='https://huggingface.co/mashb1t/misc/resolve/main/sam_vit_l_0b3195.pth',
-        model_dir=path_sam,
-        file_name='sam_vit_l_0b3195.pth'
-    )
+    manifest_download("sam-vit-l", model_dir=path_sam)
     return os.path.join(path_sam, 'sam_vit_l_0b3195.pth')
 
 
 def downloading_sam_vit_h():
-    load_file_from_url(
-        url='https://huggingface.co/mashb1t/misc/resolve/main/sam_vit_h_4b8939.pth',
-        model_dir=path_sam,
-        file_name='sam_vit_h_4b8939.pth'
-    )
+    manifest_download("sam-vit-h", model_dir=path_sam)
     return os.path.join(path_sam, 'sam_vit_h_4b8939.pth')

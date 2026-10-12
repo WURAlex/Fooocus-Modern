@@ -27,6 +27,8 @@ from modules.launch_util import (
     delete_folder_content,
 )
 from modules.model_loader import load_file_from_url
+from modules.model_manifest import download as manifest_download
+from modules.model_manifest import download_user_supplied
 
 
 REINSTALL_ALL = False
@@ -37,20 +39,10 @@ TRY_INSTALL_XFORMERS = False
 # VAE / auxiliary model downloads
 # ---------------------------------------------------------
 
-vae_approx_filenames = [
-    (
-        'xlvaeapp.pth',
-        'https://huggingface.co/lllyasviel/misc/resolve/main/xlvaeapp.pth',
-    ),
-    (
-        'vaeapp_sd15.pth',
-        'https://huggingface.co/lllyasviel/misc/resolve/main/vaeapp_sd15.pt',
-    ),
-    (
-        'xl-to-v1_interposer-v4.0.safetensors',
-        'https://huggingface.co/mashb1t/misc/resolve/main/'
-        'xl-to-v1_interposer-v4.0.safetensors',
-    ),
+vae_approx_artifacts = [
+    'vae-approx-xl',
+    'vae-approx-sd15',
+    'xl-v1-interposer',
 ]
 
 
@@ -164,24 +156,19 @@ def download_models(
     # Approximate VAE files
     # -----------------------------------------------------
 
-    for file_name, url in vae_approx_filenames:
-        load_file_from_url(
-            url=url,
+    for artifact_id in vae_approx_artifacts:
+        manifest_download(
+            artifact_id,
             model_dir=config.path_vae_approx,
-            file_name=file_name,
         )
 
     # -----------------------------------------------------
     # Fooocus expansion model
     # -----------------------------------------------------
 
-    load_file_from_url(
-        url=(
-            "https://huggingface.co/lllyasviel/misc/"
-            "resolve/main/fooocus_expansion.bin"
-        ),
+    manifest_download(
+        "fooocus-expansion",
         model_dir=config.path_fooocus_expansion,
-        file_name="pytorch_model.bin",
     )
 
     # -----------------------------------------------------
@@ -242,22 +229,14 @@ def download_models(
             )
         )
 
-        load_file_from_url(
-            url=url,
-            model_dir=model_dir,
-            file_name=file_name,
-        )
+        download_user_supplied(file_name, url, model_dir)
 
     # -----------------------------------------------------
     # Embeddings
     # -----------------------------------------------------
 
     for file_name, url in embeddings_downloads.items():
-        load_file_from_url(
-            url=url,
-            model_dir=config.path_embeddings,
-            file_name=file_name,
-        )
+        download_user_supplied(file_name, url, config.path_embeddings)
 
     # -----------------------------------------------------
     # LoRAs
@@ -271,22 +250,14 @@ def download_models(
             )
         )
 
-        load_file_from_url(
-            url=url,
-            model_dir=model_dir,
-            file_name=file_name,
-        )
+        download_user_supplied(file_name, url, model_dir)
 
     # -----------------------------------------------------
     # VAE
     # -----------------------------------------------------
 
     for file_name, url in vae_downloads.items():
-        load_file_from_url(
-            url=url,
-            model_dir=config.path_vae,
-            file_name=file_name,
-        )
+        download_user_supplied(file_name, url, config.path_vae)
 
     return default_model, checkpoint_downloads
 

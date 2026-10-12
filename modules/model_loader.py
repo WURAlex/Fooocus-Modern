@@ -1094,6 +1094,14 @@ class DownloadDeadlineExceeded(TimeoutError):
     """
 
 
+class CachedFileIntegrityError(ValueError):
+    """
+    Raised when an existing cached file fails trusted-hash verification and the
+    caller requested fail-closed behavior (`cached_hash_mismatch="fail"`).
+    The mismatched file is left untouched; recovery requires explicit removal.
+    """
+
+
 def _is_transient_error(exc: Exception) -> bool:
     """
     Determine if an exception represents a transient failure eligible for retry.
@@ -1153,6 +1161,7 @@ def download_file(
     retry_backoff: Optional[float] = None,
     max_size: Optional[int] = None,
     max_duration: Optional[float] = None,
+    cached_hash_mismatch: str = "redownload",
 ) -> str:
     """
     Download a file from `url` to `destination` with:
@@ -1176,6 +1185,12 @@ def download_file(
     """
     dest_path = Path(destination).resolve()
     dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if cached_hash_mismatch not in ("redownload", "fail"):
+        raise ValueError(
+            f"cached_hash_mismatch must be 'redownload' or 'fail', "
+            f"got {cached_hash_mismatch!r}"
+        )
 
     url = _resolve_huggingface_mirror(url)
     _validate_url(
@@ -1277,6 +1292,13 @@ def download_file(
                     chunk_size=chunk_size,
                 ):
                     return str(dest_path)
+                if cached_hash_mismatch == "fail":
+                    raise CachedFileIntegrityError(
+                        f"Cached file {dest_path} failed {hash_algorithm} "
+                        f"verification (expected {expected_hash}). The file was "
+                        f"left untouched; remove it explicitly and retry to "
+                        f"re-download."
+                    )
                 print(
                     f"[Integrity] Existing file {dest_path.name} failed "
                     f"{hash_algorithm} verification. Re-downloading."
@@ -1499,6 +1521,7 @@ def load_file_from_url(
     retry_backoff: Optional[float] = None,
     max_size: Optional[int] = None,
     max_duration: Optional[float] = None,
+    cached_hash_mismatch: str = "redownload",
 ) -> str:
     """
     Download a model file securely and return its local path.
@@ -1529,6 +1552,7 @@ def load_file_from_url(
         retry_backoff=retry_backoff,
         max_size=max_size,
         max_duration=max_duration,
+        cached_hash_mismatch=cached_hash_mismatch,
     )
 
 

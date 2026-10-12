@@ -17,7 +17,7 @@ import onnxruntime as ort
 from PIL import Image
 from onnxruntime import InferenceSession
 from modules.config import path_clip_vision
-from modules.model_loader import load_file_from_url
+from modules.model_manifest import download as manifest_download
 
 
 global_model = None
@@ -27,18 +27,14 @@ global_csv = None
 def default_interrogator(image_rgb, threshold=0.35, character_threshold=0.85, exclude_tags=""):
     global global_model, global_csv
 
-    model_name = "wd-v1-4-moat-tagger-v2"
-
-    model_onnx_filename = load_file_from_url(
-        url=f'https://huggingface.co/lllyasviel/misc/resolve/main/{model_name}.onnx',
+    model_onnx_filename = manifest_download(
+        "wd14-tagger-onnx",
         model_dir=path_clip_vision,
-        file_name=f'{model_name}.onnx',
     )
 
-    model_csv_filename = load_file_from_url(
-        url=f'https://huggingface.co/lllyasviel/misc/resolve/main/{model_name}.csv',
+    model_csv_filename = manifest_download(
+        "wd14-tagger-csv",
         model_dir=path_clip_vision,
-        file_name=f'{model_name}.csv',
     )
 
     if global_model is not None:

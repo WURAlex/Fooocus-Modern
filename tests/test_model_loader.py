@@ -1062,6 +1062,7 @@ class TestIntegrationCompatibility(unittest.TestCase):
             retry_backoff=None,
             max_size=None,
             max_duration=None,
+            cached_hash_mismatch="redownload",
         )
 
         # 2. extras/interrogate.py style (positional url, kwargs model_dir, file_name)
@@ -1083,6 +1084,7 @@ class TestIntegrationCompatibility(unittest.TestCase):
             retry_backoff=None,
             max_size=None,
             max_duration=None,
+            cached_hash_mismatch="redownload",
         )
 
         # 3. extras/facexlib/utils/misc.py style (download_url_to_file)
