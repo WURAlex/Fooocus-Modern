@@ -45,6 +45,12 @@ DEFAULT_RETRY_BACKOFF: float = 1.0  # seconds
 DEFAULT_MAX_DOWNLOAD_SIZE: int = 50 * 1024 * 1024 * 1024  # 50 GiB
 DEFAULT_MAX_DURATION: float = 1800.0  # 30 minutes
 
+# Explicit opt-in channel for HTTPS proxies. Proxy use is rejected by default;
+# this is deliberately kept separate from the destination allowlist
+# (FOOOCUS_ALLOWED_DOWNLOAD_HOSTS): authorizing a download host must never
+# silently authorize proxying traffic through it.
+HTTPS_PROXY_ALLOW_ENV = "FOOOCUS_ALLOWED_HTTPS_PROXIES"
+
 
 # ---------------------------------------------------------
 # Process and thread synchronization for concurrent downloads
@@ -483,6 +489,206 @@ def _validate_url(
             )
 
 
+# ---------------------------------------------------------
+# HTTPS proxy policy (fail closed)
+# ---------------------------------------------------------
+
+
+def _parse_proxy_endpoint(
+    endpoint: Optional[str],
+    *,
+    require_clean: bool = True,
+) -> Optional[Tuple[Optional[str], str, Optional[int]]]:
+    """
+    Parse a proxy endpoint into (scheme, host, port); scheme/port are None when
+    not explicitly specified. Returns None when the endpoint is unparseable.
+
+    `require_clean=True` (used for approval entries) additionally rejects
+    endpoints carrying a path/query/fragment, which are never meaningful in an
+    authorization list. With `require_clean=False` they are ignored, mirroring
+    urllib, whose `_parse_proxy` dials the netloc only.
+    """
+    if not endpoint or not str(endpoint).strip():
+        return None
+
+    value = str(endpoint).strip()
+    if "://" in value:
+        parsed = urlparse(value)
+        scheme = (parsed.scheme or "").lower() or None
+    else:
+        parsed = urlparse("//" + value)
+        scheme = None
+
+    if require_clean and (
+        parsed.path not in ("", "/") or parsed.query or parsed.fragment
+    ):
+        return None
+
+    try:
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+
+    if not host:
+        return None
+
+    return (scheme, host.lower(), port)
+
+
+def _parse_approved_proxy_entries(
+    entries: Iterable[str],
+) -> List[Tuple[Optional[str], str, Optional[int]]]:
+    """
+    Parse approval entries from FOOOCUS_ALLOWED_HTTPS_PROXIES. Fail closed:
+    a malformed entry is a configuration error, not something to ignore.
+    """
+    approved: List[Tuple[Optional[str], str, Optional[int]]] = []
+    for entry in entries:
+        entry = (entry or "").strip()
+        if not entry:
+            continue
+        parsed = _parse_proxy_endpoint(entry, require_clean=True)
+        if parsed is None:
+            # Redacted: an approval entry may itself carry credentials, and
+            # configuration errors end up in logs and consoles.
+            raise ValueError(
+                f"Invalid {HTTPS_PROXY_ALLOW_ENV} entry: "
+                f"{_redact_proxy_display(entry)!r}. Expected "
+                "'host', 'host:port' or 'scheme://host:port'."
+            )
+        approved.append(parsed)
+    return approved
+
+
+def _load_approved_proxy_entries() -> List[str]:
+    """Raw (unparsed) approval entries from the environment, empties dropped."""
+    raw = os.environ.get(HTTPS_PROXY_ALLOW_ENV) or ""
+    return [entry.strip() for entry in raw.split(",") if entry.strip()]
+
+
+def _proxy_endpoint_allowed(
+    host: str,
+    port: Optional[int],
+    approved: Iterable[Tuple[Optional[str], str, Optional[int]]],
+) -> bool:
+    """
+    Match a proxy endpoint (host, port) against approved entries. An approval
+    entry without a port matches any port on that host; an entry with a port
+    must match exactly. Schemes are not compared: for HTTPS requests urllib
+    always dials the proxy's TCP endpoint and issues CONNECT regardless of the
+    scheme in the proxy URL (verified against urllib.request), so host:port is
+    the authorization unit.
+    """
+    host = (host or "").lower().strip("[]")
+    if not host:
+        return False
+    if port is None:
+        port = 443  # https connection default when no port is specified
+
+    for _scheme, approved_host, approved_port in approved:
+        if approved_host == host and (approved_port is None or approved_port == port):
+            return True
+    return False
+
+
+def _configured_https_proxy(hostname: str) -> Optional[str]:
+    """
+    Return the proxy urllib itself would use for an HTTPS request to
+    `hostname`, or None when the request would go direct.
+
+    `hostname` is the request authority host[:port] exactly as urllib's
+    Request.host carries it -- including any explicit URL port, which a
+    port-qualified NO_PROXY entry needs in order to match.
+
+    Mirrors urllib's selection rules exactly (same API calls its ProxyHandler
+    makes): only the "https" entry of getproxies() applies to https:// URLs --
+    HTTP_PROXY, ALL_PROXY and FTP_PROXY entries are ignored for HTTPS requests
+    and cannot cause a tunnel -- and a NO_PROXY entry covering this destination
+    bypasses the proxy entirely. Any error while evaluating the bypass is
+    treated as "not bypassed" (fail closed).
+    """
+    proxy_url = urllib.request.getproxies().get("https")
+    if not proxy_url:
+        return None
+
+    try:
+        if urllib.request.proxy_bypass(hostname):
+            return None
+    except Exception:
+        pass
+
+    return proxy_url
+
+
+def _redact_proxy_display(value: str) -> str:
+    """Render a proxy URL for error messages with credentials stripped."""
+    value = str(value)
+    if "://" in value:
+        scheme, _, rest = value.partition("://")
+        if "@" in rest:
+            # rsplit: a password may itself contain "@"; everything up to the
+            # last "@" is userinfo.
+            return f"{scheme}://***@{rest.rsplit('@', 1)[1]}"
+    elif "@" in value:
+        return "***@" + value.rsplit("@", 1)[1]
+    return value
+
+
+def _enforce_proxy_policy(
+    hostname: str,
+) -> List[str]:
+    """
+    Phase A (fail closed): refuse the download unless every proxy urllib would
+    use for this HTTPS request is explicitly authorized through
+    FOOOCUS_ALLOWED_HTTPS_PROXIES (kept separate from the destination
+    allowlist), is not private/local, and resolves to public IPs only.
+
+    `hostname` is the request authority host[:port], passed through unchanged
+    to _configured_https_proxy so the bypass decision matches urllib's
+    Request.host exactly.
+
+    Returns the raw approval entries so the connection layer can re-check them
+    at CONNECT time (defense in depth against any detection gap or proxy
+    configuration change between validation and connection).
+    """
+    approved_entries = _load_approved_proxy_entries()
+    # Parse even when no proxy is configured so a malformed approval list is a
+    # deterministic configuration error, independent of ambient proxy state.
+    approved = _parse_approved_proxy_entries(approved_entries)
+
+    proxy_url = _configured_https_proxy(hostname)
+    if not proxy_url:
+        return approved_entries
+
+    parsed = _parse_proxy_endpoint(proxy_url, require_clean=False)
+    if parsed is None:
+        raise ValueError(
+            f"Refusing unparseable HTTPS proxy: {_redact_proxy_display(proxy_url)!r}."
+        )
+
+    _scheme, proxy_host, proxy_port = parsed
+    effective_port = proxy_port if proxy_port is not None else 443
+    display = _redact_proxy_display(proxy_url)
+
+    if not _proxy_endpoint_allowed(proxy_host, effective_port, approved):
+        raise ValueError(
+            f"Refusing to use unapproved HTTPS proxy: {display!r}. "
+            f"Set {HTTPS_PROXY_ALLOW_ENV} to authorize this proxy endpoint."
+        )
+
+    if _is_private_or_local_host(proxy_host):
+        raise ValueError(
+            f"Refusing proxy connection to local or private address: {display!r}"
+        )
+
+    # Approval is not enough: an approved proxy endpoint must still resolve to
+    # public addresses, exactly like a direct destination.
+    _resolve_and_validate_addresses(proxy_host, effective_port)
+
+    return approved_entries
+
+
 def _safe_destination(model_dir: str, file_name: str) -> Path:
     """
     Validate destination directory and filename against path traversal.
@@ -536,15 +742,27 @@ class SafeHTTPSConnection(http.client.HTTPSConnection):
     When the connection runs through a CONNECT proxy, the proxy performs its own DNS
     resolution, so the validated target address cannot be pinned on our side. The target
     is therefore resolved and validated *before* the tunnel is opened and the request
-    fails closed if that validation cannot be satisfied. Remaining limitation: a proxy
-    that re-resolves the target after our validation could still be pointed elsewhere
-    (TOCTOU through the proxy). Only use proxies you control.
+    fails closed if that validation cannot be satisfied. Opening a tunnel additionally
+    requires the proxy endpoint to be authorized via FOOOCUS_ALLOWED_HTTPS_PROXIES;
+    an unapproved proxy is refused before any address validation or connection.
+    Remaining limitation: a proxy that re-resolves the target after our validation
+    could still be pointed elsewhere (TOCTOU through the proxy). Only use proxies
+    you control.
     """
 
-    def __init__(self, host, port=None, allowed_hosts=None, allowed_domains=None, **kwargs):
+    def __init__(
+        self,
+        host,
+        port=None,
+        allowed_hosts=None,
+        allowed_domains=None,
+        allowed_proxies=None,
+        **kwargs,
+    ):
         super().__init__(host, port=port, **kwargs)
         self.allowed_hosts = allowed_hosts
         self.allowed_domains = allowed_domains
+        self.allowed_proxies = list(allowed_proxies) if allowed_proxies else []
 
     def _validate_target_host(self, target_host: str) -> None:
         """
@@ -566,24 +784,54 @@ class SafeHTTPSConnection(http.client.HTTPSConnection):
             # `self.host` is already split from the port by http.client; splitting it
             # again on ":" corrupted IPv6 literals ("fe80::1" became "fe80").
             proxy_host = _hostname_without_port(self.host).strip("[]")
+            proxy_port = self.port or 443
+
+            # Defense in depth: a CONNECT tunnel requires explicit approval even
+            # when download_file's Phase A check already passed, so no code path
+            # (including a proxy configuration swapped in after validation) can
+            # tunnel through an unauthorized proxy.
+            approved = _parse_approved_proxy_entries(self.allowed_proxies)
+            if not _proxy_endpoint_allowed(proxy_host, proxy_port, approved):
+                display = (
+                    f"[{proxy_host}]:{proxy_port}"
+                    if ":" in proxy_host
+                    else f"{proxy_host}:{proxy_port}"
+                )
+                raise ValueError(
+                    f"Refusing to use unapproved HTTPS proxy: {display!r}. "
+                    f"Set {HTTPS_PROXY_ALLOW_ENV} to authorize this proxy endpoint."
+                )
+
+            # Private/local proxy endpoints are rejected even when approved
+            # and even when their address appears in the *destination*
+            # allowlist: proxy authorization is a separate decision from
+            # destination authorization (identical rule in Phase A).
             if _is_private_or_local_host(proxy_host):
-                allowed_literals = {
-                    entry.strip().lower().strip("[]")
-                    for entry in (self.allowed_hosts or set())
-                }
-                if proxy_host.lower() not in allowed_literals:
-                    raise ValueError(
-                        f"Refusing proxy connection to local or private address: {self.host!r}"
-                    )
+                raise ValueError(
+                    f"Refusing proxy connection to local or private address: {self.host!r}"
+                )
 
             # Fail closed: a proxy *name* is resolved and validated as well, so a
             # host name pointing at loopback/link-local is not a way around the
-            # literal-IP check above.
-            _resolve_and_validate_addresses(
+            # literal-IP check above -- and the socket is then pinned to that
+            # validated address, so `super().connect()` cannot re-resolve the
+            # name into a different (e.g. private) address in between. This is
+            # the same rebinding TOCTOU protection the direct path applies;
+            # TLS is unaffected because the certificate is validated against
+            # `_tunnel_host` (the destination), never the proxy address.
+            proxy_ip, _ = _resolve_and_validate_addresses(
                 proxy_host,
                 self.port or 443,
                 allowed_hosts=self.allowed_hosts,
             )
+            pinned_ip = proxy_ip
+
+            def _pinned_create_connection(addr, timeout=None, source_address=None):
+                return socket.create_connection(
+                    (pinned_ip, addr[1]), timeout, source_address
+                )
+
+            self._create_connection = _pinned_create_connection
 
             # Fail closed: the tunnel destination must be validated exactly like a
             # direct destination, otherwise the proxy would bypass SSRF checks.
@@ -625,10 +873,18 @@ class SafeHTTPSHandler(urllib.request.HTTPSHandler):
     HTTPS handler that uses SafeHTTPSConnection to enforce DNS pinning and SSRF validation.
     """
 
-    def __init__(self, allowed_hosts=None, allowed_domains=None, context=None, **kwargs):
+    def __init__(
+        self,
+        allowed_hosts=None,
+        allowed_domains=None,
+        allowed_proxies=None,
+        context=None,
+        **kwargs,
+    ):
         super().__init__(context=context, **kwargs)
         self.allowed_hosts = allowed_hosts
         self.allowed_domains = allowed_domains
+        self.allowed_proxies = allowed_proxies
 
     def https_open(self, req):
         def connection_factory(host, **kwargs):
@@ -636,6 +892,7 @@ class SafeHTTPSHandler(urllib.request.HTTPSHandler):
                 host,
                 allowed_hosts=self.allowed_hosts,
                 allowed_domains=self.allowed_domains,
+                allowed_proxies=self.allowed_proxies,
                 context=self._context,
                 **kwargs,
             )
@@ -900,6 +1157,10 @@ def download_file(
     """
     Download a file from `url` to `destination` with:
     - Enforced HTTPS and host/domain validation
+    - Fail-closed proxy policy: environment proxies are rejected unless the
+      endpoint is authorized via FOOOCUS_ALLOWED_HTTPS_PROXIES (separate from
+      the destination allowlist), public-address validated in both the
+      pre-flight check and at CONNECT time
     - Socket-level DNS rebinding and SSRF protection
     - Hardened redirect inspection (blocks insecure or untrusted hops)
     - Memory-efficient chunked streaming
@@ -921,6 +1182,15 @@ def download_file(
         url,
         allowed_hosts=allowed_hosts,
         allowed_domains=allowed_domains,
+    )
+    # Fail-closed proxy policy: rejected before any lock, temporary file, DNS
+    # lookup of the destination, or other network activity. The gate receives
+    # the authority exactly as urllib's Request.host carries it -- with any
+    # explicit URL port (userinfo is impossible here: _validate_url rejected
+    # it above) -- so a port-qualified NO_PROXY entry bypasses the proxy for
+    # the gate on precisely the same cases urllib itself bypasses it.
+    approved_proxy_entries = _enforce_proxy_policy(
+        (urlparse(url).netloc or "").strip()
     )
 
     # Resolve limits and timeouts
@@ -1054,6 +1324,7 @@ def download_file(
             https_handler = SafeHTTPSHandler(
                 allowed_hosts=eff_hosts,
                 allowed_domains=eff_domains,
+                allowed_proxies=approved_proxy_entries,
                 context=ssl_context,
             )
             opener = urllib.request.build_opener(redirect_handler, https_handler)

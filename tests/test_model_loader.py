@@ -16,6 +16,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
+from urllib.parse import urlparse
 
 from modules.model_loader import (
     DEFAULT_ALLOWED_DOMAINS,
@@ -24,11 +25,18 @@ from modules.model_loader import (
     DestinationLock,
     DownloadDeadlineExceeded,
     HardenedRedirectHandler,
+    HTTPS_PROXY_ALLOW_ENV,
     SafeHTTPSConnection,
+    _configured_https_proxy,
+    _enforce_proxy_policy,
     _is_host_allowed,
     _is_private_or_local_host,
     _is_transient_error,
     _matches_hash,
+    _parse_approved_proxy_entries,
+    _parse_proxy_endpoint,
+    _proxy_endpoint_allowed,
+    _redact_proxy_display,
     _resolve_and_validate_addresses,
     _resolve_huggingface_mirror,
     _safe_destination,
@@ -523,7 +531,12 @@ class TestProxyDestinationValidation(unittest.TestCase):
         self.assertIn("untrusted", str(ctx.exception).lower())
 
     def test_proxy_pointing_to_private_ip_blocked(self):
-        conn = SafeHTTPSConnection("169.254.169.254:8080")
+        # Approved (so the approval gate passes) but private: the address
+        # check must still reject it.
+        conn = SafeHTTPSConnection(
+            "169.254.169.254:8080",
+            allowed_proxies=["169.254.169.254:8080"],
+        )
         conn.set_tunnel("huggingface.co", 443)
         with self.assertRaises(ValueError) as ctx:
             conn.connect()
@@ -1252,6 +1265,9 @@ class TestProxyTunnelDestinationValidationRegression(unittest.TestCase):
             proxy,
             allowed_hosts=self.ALLOWED_HOSTS,
             allowed_domains=self.ALLOWED_DOMAINS,
+            # Each test's proxy is explicitly approved so the fail-closed
+            # approval gate passes and the address validation under test runs.
+            allowed_proxies=[proxy],
         )
         conn.set_tunnel(target, target_port)
         conn._context = MagicMock()
@@ -1484,6 +1500,11 @@ class TestTLSVerificationNeverDisabled(unittest.TestCase):
         self.assertNotIn("_create_unverified_context", text)
         self.assertNotIn("CERT_NONE", text)
 
+    def test_safe_https_connection_context_requires_verification(self):
+        conn = SafeHTTPSConnection("huggingface.co", port=443)
+        self.assertEqual(conn._context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(conn._context.check_hostname)
+
     def test_live_handshake_accepts_valid_certificate(self):
         context = ssl.create_default_context()
         with socket.create_connection(("huggingface.co", 443), timeout=15) as raw:
@@ -1497,6 +1518,726 @@ class TestTLSVerificationNeverDisabled(unittest.TestCase):
         with socket.create_connection(("huggingface.co", 443), timeout=15) as raw:
             with self.assertRaises((ssl.SSLError, ssl.CertificateError)):
                 context.wrap_socket(raw, server_hostname="evil-hacker.com")
+
+
+# ---------------------------------------------------------
+# Fail-closed HTTPS proxy policy
+# ---------------------------------------------------------
+
+PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "FTP_PROXY",
+    "ftp_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "FOOOCUS_ALLOWED_HTTPS_PROXIES",
+    "FOOOCUS_ALLOWED_DOWNLOAD_HOSTS",
+)
+
+
+def _proxy_env(**overrides):
+    """
+    Hermetic proxy environment for one test: every proxy-related variable is
+    present but empty (urllib ignores empty values), then only the given
+    overrides are applied, so the ambient environment of whoever runs the
+    suite cannot influence proxy-policy tests.
+
+    Overrides are mirrored into both case variants because urllib's second
+    pass lets an empty lowercase `*_proxy` value remove a value that was set
+    in the uppercase spelling.
+    """
+    env = {key: "" for key in PROXY_ENV_KEYS}
+    env.update(overrides)
+    for key, value in overrides.items():
+        for variant in (key.lower(), key.upper()):
+            if variant in PROXY_ENV_KEYS:
+                env[variant] = value
+    return patch.dict(os.environ, env)
+
+
+def _mock_success_opener(mock_build_opener, data=b"model-payload"):
+    buffer = io.BytesIO(data)
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.headers = {"Content-Length": str(len(data))}
+    mock_resp.read.side_effect = lambda amt: buffer.read(amt)
+    mock_resp.__enter__.return_value = mock_resp
+    mock_resp.__exit__.return_value = None
+    mock_opener = MagicMock()
+    mock_opener.open.return_value = mock_resp
+    mock_build_opener.return_value = mock_opener
+    return mock_opener
+
+
+class TestFailClosedProxyPolicy(unittest.TestCase):
+    """
+    Phase A: download_file refuses any proxy urllib would use unless the proxy
+    endpoint is explicitly authorized via FOOOCUS_ALLOWED_HTTPS_PROXIES,
+    validated as public-address only, and checked before any other network
+    activity. Proxy approval is deliberately separate from the destination
+    allowlist.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _download(self, dest_name="proxy_policy.bin", **kwargs):
+        return download_file(
+            "https://huggingface.co/test/model.bin",
+            destination=Path(self.temp_dir) / dest_name,
+            progress=False,
+            **kwargs,
+        )
+
+    @patch("urllib.request.build_opener")
+    def test_unapproved_https_proxy_blocks_download(self, mock_build_opener):
+        with _proxy_env(HTTPS_PROXY="http://proxy.example:3128"):
+            with self.assertRaises(ValueError) as ctx:
+                self._download()
+
+        message = str(ctx.exception)
+        self.assertIn("unapproved", message.lower())
+        self.assertIn(HTTPS_PROXY_ALLOW_ENV, message)
+        mock_build_opener.assert_not_called()
+        self.assertEqual(_residual_files(self.temp_dir), [])
+
+    @patch("urllib.request.build_opener")
+    def test_destination_allowlist_does_not_authorize_proxy(self, mock_build_opener):
+        # Authorizing a *destination* host must never authorize proxying
+        # traffic through it: the two allowlists stay independent.
+        with _proxy_env(
+            HTTPS_PROXY="http://evil-corp.example:3128",
+            FOOOCUS_ALLOWED_DOWNLOAD_HOSTS="evil-corp.example",
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                self._download()
+
+        self.assertIn("unapproved", str(ctx.exception).lower())
+        mock_build_opener.assert_not_called()
+
+    @patch("urllib.request.build_opener")
+    @patch("socket.getaddrinfo")
+    def test_approved_https_proxy_allows_download(self, mock_gai, mock_build_opener):
+        mock_gai.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ]
+        _mock_success_opener(mock_build_opener)
+        with _proxy_env(
+            HTTPS_PROXY="http://proxy.example:3128",
+            **{HTTPS_PROXY_ALLOW_ENV: "proxy.example:3128"},
+        ):
+            path = self._download()
+
+        # Approval and public-address validation passed, download proceeded.
+        mock_gai.assert_called_once()
+        self.assertEqual(mock_gai.call_args[0][0], "proxy.example")
+        self.assertTrue(Path(path).is_file())
+        mock_build_opener.assert_called_once()
+
+    @patch("urllib.request.build_opener")
+    @patch("socket.getaddrinfo")
+    def test_portless_approval_entry_matches_any_proxy_port(
+        self, mock_gai, mock_build_opener
+    ):
+        mock_gai.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ]
+        _mock_success_opener(mock_build_opener)
+        with _proxy_env(
+            HTTPS_PROXY="http://proxy.example:8443",
+            **{HTTPS_PROXY_ALLOW_ENV: "proxy.example"},
+        ):
+            path = self._download()
+
+        self.assertTrue(Path(path).is_file())
+        mock_build_opener.assert_called_once()
+
+    @patch("urllib.request.build_opener")
+    def test_approval_port_mismatch_blocks(self, mock_build_opener):
+        with _proxy_env(
+            HTTPS_PROXY="http://proxy.example:8443",
+            **{HTTPS_PROXY_ALLOW_ENV: "proxy.example:3128"},
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                self._download()
+
+        self.assertIn("unapproved", str(ctx.exception).lower())
+        mock_build_opener.assert_not_called()
+
+    @patch("urllib.request.build_opener")
+    def test_proxy_credentials_never_leak_into_errors(self, mock_build_opener):
+        with _proxy_env(HTTPS_PROXY="http://user:secret@proxy.example:3128"):
+            with self.assertRaises(ValueError) as ctx:
+                self._download()
+
+        message = str(ctx.exception)
+        self.assertIn("unapproved", message.lower())
+        self.assertNotIn("secret", message)
+        self.assertIn("proxy.example:3128", message)
+        mock_build_opener.assert_not_called()
+
+    @patch("urllib.request.build_opener")
+    def test_approved_but_private_proxy_blocked(self, mock_build_opener):
+        with _proxy_env(
+            HTTPS_PROXY="http://127.0.0.1:3128",
+            **{HTTPS_PROXY_ALLOW_ENV: "127.0.0.1:3128"},
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                self._download()
+
+        self.assertIn(
+            "refusing proxy connection to local or private address",
+            str(ctx.exception).lower(),
+        )
+        mock_build_opener.assert_not_called()
+
+    @patch("urllib.request.build_opener")
+    def test_private_proxy_rejected_even_when_destination_allowlisted(
+        self, mock_build_opener
+    ):
+        # Proxy authorization is a separate decision from destination
+        # authorization: a destination-allowlisted private address must not
+        # become usable as a proxy.
+        with _proxy_env(
+            HTTPS_PROXY="http://10.0.0.5:3128",
+            FOOOCUS_ALLOWED_DOWNLOAD_HOSTS="10.0.0.5",
+            **{HTTPS_PROXY_ALLOW_ENV: "10.0.0.5:3128"},
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                self._download()
+
+        self.assertIn(
+            "refusing proxy connection to local or private address",
+            str(ctx.exception).lower(),
+        )
+        mock_build_opener.assert_not_called()
+
+    @patch("urllib.request.build_opener")
+    @patch("socket.getaddrinfo")
+    def test_approved_proxy_resolving_to_private_address_blocked(
+        self, mock_gai, mock_build_opener
+    ):
+        mock_gai.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 3128))
+        ]
+        with _proxy_env(
+            HTTPS_PROXY="http://proxy.example.org:3128",
+            **{HTTPS_PROXY_ALLOW_ENV: "proxy.example.org:3128"},
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                self._download()
+
+        message = str(ctx.exception)
+        self.assertIn("proxy.example.org", message)
+        self.assertIn("private/local address", message.lower())
+        # Only the proxy was resolved; the destination was never contacted.
+        mock_gai.assert_called_once()
+        self.assertEqual(mock_gai.call_args[0][0], "proxy.example.org")
+        mock_build_opener.assert_not_called()
+
+    @patch("urllib.request.build_opener")
+    def test_unparseable_proxy_url_blocks_download(self, mock_build_opener):
+        with _proxy_env(HTTPS_PROXY="http://"):
+            with self.assertRaises(ValueError) as ctx:
+                self._download()
+
+        self.assertIn("unparseable", str(ctx.exception).lower())
+        mock_build_opener.assert_not_called()
+
+    @patch("urllib.request.build_opener")
+    def test_malformed_approval_entry_fails_closed(self, mock_build_opener):
+        # A malformed approval list is a deterministic configuration error,
+        # raised even when no proxy is configured at all.
+        with _proxy_env(**{HTTPS_PROXY_ALLOW_ENV: "http://"}):
+            with self.assertRaises(ValueError) as ctx:
+                self._download()
+
+        message = str(ctx.exception)
+        self.assertIn("invalid", message.lower())
+        self.assertIn(HTTPS_PROXY_ALLOW_ENV, message)
+        mock_build_opener.assert_not_called()
+
+    @patch("urllib.request.build_opener")
+    def test_no_proxy_bypass_allows_direct_download(self, mock_build_opener):
+        # Mirrors urllib: NO_PROXY covering the destination bypasses the proxy
+        # entirely, so there is nothing to authorize.
+        _mock_success_opener(mock_build_opener)
+        with _proxy_env(
+            HTTPS_PROXY="http://proxy.example:3128",
+            NO_PROXY="huggingface.co",
+        ):
+            path = self._download()
+
+        self.assertTrue(Path(path).is_file())
+        mock_build_opener.assert_called_once()
+
+    @patch("urllib.request.build_opener")
+    def test_http_proxy_env_is_ignored_for_https_requests(self, mock_build_opener):
+        # urllib never applies the "http" proxy entry to https:// requests
+        # (verified against urllib.request), so it cannot cause a tunnel and
+        # must not block an otherwise direct download.
+        _mock_success_opener(mock_build_opener)
+        with _proxy_env(HTTP_PROXY="http://proxy.example:3128"):
+            path = self._download()
+
+        self.assertTrue(Path(path).is_file())
+        mock_build_opener.assert_called_once()
+
+    @patch("urllib.request.build_opener")
+    def test_all_proxy_env_is_ignored_for_https_requests(self, mock_build_opener):
+        # Same for ALL_PROXY: urllib's ProxyHandler only consults the entry
+        # whose key matches the request scheme.
+        _mock_success_opener(mock_build_opener)
+        with _proxy_env(ALL_PROXY="http://proxy.example:1080"):
+            path = self._download()
+
+        self.assertTrue(Path(path).is_file())
+        mock_build_opener.assert_called_once()
+
+    @patch("urllib.request.build_opener")
+    def test_no_proxy_entry_with_port_matches_url_with_port(self, mock_build_opener):
+        # urllib compares NO_PROXY against Request.host, which keeps any
+        # explicit URL port; the gate must bypass on exactly the same cases,
+        # otherwise it would refuse a download urllib itself sends direct.
+        _mock_success_opener(mock_build_opener)
+        with _proxy_env(
+            HTTPS_PROXY="http://proxy.example:3128",
+            NO_PROXY="huggingface.co:443",
+        ):
+            path = download_file(
+                "https://huggingface.co:443/test/model.bin",
+                destination=Path(self.temp_dir) / "port_bypass.bin",
+                progress=False,
+            )
+
+        self.assertTrue(Path(path).is_file())
+        mock_build_opener.assert_called_once()
+
+    @patch("urllib.request.build_opener")
+    def test_no_proxy_entry_for_unlisted_port_does_not_bypass(
+        self, mock_build_opener
+    ):
+        # The port-qualified entry must not broaden: an entry naming a
+        # different port than the request's leaves the proxy in force.
+        with _proxy_env(
+            HTTPS_PROXY="http://proxy.example:3128",
+            NO_PROXY="huggingface.co:8443",
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                download_file(
+                    "https://huggingface.co:443/test/model.bin",
+                    destination=Path(self.temp_dir) / "port_no_bypass.bin",
+                    progress=False,
+                )
+
+        self.assertIn("unapproved", str(ctx.exception).lower())
+        mock_build_opener.assert_not_called()
+
+    @patch("urllib.request.build_opener")
+    def test_approval_entry_credentials_never_leak_into_errors(
+        self, mock_build_opener
+    ):
+        # Approval entries may themselves carry credentials; a malformed one
+        # must be reported without them.
+        with _proxy_env(
+            **{HTTPS_PROXY_ALLOW_ENV: "http://user:secret@proxy.example:notaport"}
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                self._download()
+
+        message = str(ctx.exception)
+        self.assertIn("invalid", message.lower())
+        self.assertIn(HTTPS_PROXY_ALLOW_ENV, message)
+        self.assertNotIn("secret", message)
+        self.assertNotIn("user", message)
+        self.assertIn("proxy.example:notaport", message)
+        mock_build_opener.assert_not_called()
+
+
+class TestProxyDetectionMirrorsUrllib(unittest.TestCase):
+    """
+    Detection must follow urllib's own selection rules: only the https proxy
+    entry can proxy an https:// request, and NO_PROXY covering the destination
+    bypasses it.
+    """
+
+    def _detect(self, hostname="huggingface.co", **env):
+        with _proxy_env(**env):
+            return _configured_https_proxy(hostname)
+
+    def test_https_proxy_selected(self):
+        self.assertEqual(
+            self._detect(HTTPS_PROXY="http://proxy.example:3128"),
+            "http://proxy.example:3128",
+        )
+
+    def test_lowercase_https_proxy_selected(self):
+        self.assertEqual(
+            self._detect(https_proxy="http://proxy.example:3128"),
+            "http://proxy.example:3128",
+        )
+
+    def test_http_proxy_ignored_for_https_requests(self):
+        self.assertIsNone(self._detect(HTTP_PROXY="http://proxy.example:3128"))
+
+    def test_all_proxy_ignored_for_https_requests(self):
+        self.assertIsNone(self._detect(ALL_PROXY="http://proxy.example:1080"))
+
+    def test_ftp_proxy_ignored_for_https_requests(self):
+        self.assertIsNone(self._detect(FTP_PROXY="http://proxy.example:2121"))
+
+    def test_no_proxy_bypasses(self):
+        self.assertIsNone(
+            self._detect(
+                HTTPS_PROXY="http://proxy.example:3128",
+                NO_PROXY="huggingface.co",
+            )
+        )
+
+    def test_no_proxy_for_other_host_does_not_bypass(self):
+        self.assertEqual(
+            self._detect(
+                HTTPS_PROXY="http://proxy.example:3128",
+                NO_PROXY="other.example",
+            ),
+            "http://proxy.example:3128",
+        )
+
+    def test_no_proxy_environment_yields_none(self):
+        self.assertIsNone(self._detect())
+
+    def test_gate_agrees_with_urllib_on_every_selection_case(self):
+        """
+        Ground truth is urllib itself: ProxyHandler rewrites Request.host to
+        the proxy endpoint exactly when it would tunnel, and leaves it
+        untouched when it bypasses or goes direct. The gate must agree on
+        every case -- including the host[:port] form Request.host carries for
+        URLs with an explicit port.
+        """
+        dest = "https://huggingface.co/model.bin"
+        dest_443 = "https://huggingface.co:443/model.bin"
+        dest_8443 = "https://huggingface.co:8443/model.bin"
+        cases = [
+            (dest, {}),
+            (dest, {"HTTPS_PROXY": "http://proxy.example:3128"}),
+            (dest, {"https_proxy": "http://proxy.example:3128"}),
+            (dest, {"HTTPS_PROXY": "proxy.example:3128"}),
+            (dest, {"HTTP_PROXY": "http://proxy.example:3128"}),
+            (dest, {"ALL_PROXY": "http://proxy.example:1080"}),
+            (dest, {"FTP_PROXY": "http://proxy.example:2121"}),
+            # CGI guard (CVE-2016-1000110) removes only the http entry.
+            (dest, {"HTTPS_PROXY": "http://proxy.example:3128", "REQUEST_METHOD": "GET"}),
+            (dest, {"HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": "*"}),
+            (dest, {"HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": "other.example"}),
+            (dest, {"HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": "huggingface.co"}),
+            (dest, {"HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": ".huggingface.co"}),
+            # A port-qualified entry does not match a portless request host.
+            (dest, {"HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": "huggingface.co:443"}),
+            # Explicit URL ports are part of the compared host, like Request.host.
+            (dest_443, {"HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": "huggingface.co:443"}),
+            (dest_443, {"HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": "huggingface.co"}),
+            (dest_443, {"HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": "huggingface.co:8443"}),
+            (dest_443, {"HTTPS_PROXY": "http://proxy.example:3128"}),
+            (dest_8443, {"HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": "huggingface.co:8443"}),
+            (dest_8443, {"HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": "huggingface.co"}),
+            (dest_8443, {"HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": "huggingface.co:443"}),
+        ]
+        for url, env in cases:
+            with self.subTest(url=url, env=env), _proxy_env(**env):
+                handler = urllib.request.ProxyHandler()
+                req = urllib.request.Request(url)
+                before = req.host
+                if hasattr(handler, "https_open"):
+                    handler.https_open(req)
+                urllib_would_proxy = req.host != before
+
+                gate = _configured_https_proxy(urlparse(url).netloc)
+                self.assertEqual(
+                    gate is not None,
+                    urllib_would_proxy,
+                    f"gate={gate!r} vs urllib proxying={urllib_would_proxy}",
+                )
+
+
+class TestProxyEndpointParsing(unittest.TestCase):
+    def test_schemeless_with_explicit_port(self):
+        self.assertEqual(
+            _parse_proxy_endpoint("proxy.example:3128", require_clean=False),
+            (None, "proxy.example", 3128),
+        )
+
+    def test_scheme_without_port_defers_to_connection_default(self):
+        # urllib dials port 443 for a proxy URL without an explicit port (the
+        # https connection default); the gate applies the same default.
+        self.assertEqual(
+            _parse_proxy_endpoint("http://proxy.example", require_clean=False),
+            ("http", "proxy.example", None),
+        )
+
+    def test_credentials_are_not_part_of_the_endpoint(self):
+        self.assertEqual(
+            _parse_proxy_endpoint("http://user:secret@proxy.example:8443"),
+            ("http", "proxy.example", 8443),
+        )
+
+    def test_path_allowed_only_when_not_required_clean(self):
+        self.assertIsNone(
+            _parse_proxy_endpoint("http://proxy.example:3128/path", require_clean=True)
+        )
+        self.assertEqual(
+            _parse_proxy_endpoint("http://proxy.example:3128/path", require_clean=False),
+            ("http", "proxy.example", 3128),
+        )
+
+    def test_unparseable_endpoints(self):
+        for bad in (
+            "",
+            "   ",
+            "http://",
+            "://proxy.example:3128",
+            "http://proxy.example:notaport",
+        ):
+            self.assertIsNone(_parse_proxy_endpoint(bad, require_clean=False), bad)
+
+    def test_ipv6_endpoint(self):
+        self.assertEqual(
+            _parse_proxy_endpoint("[2600:1f18:1234::1]:3128"),
+            (None, "2600:1f18:1234::1", 3128),
+        )
+
+    def test_approval_matching_rules(self):
+        any_port = [(None, "proxy.example", None)]
+        exact = [(None, "proxy.example", 3128)]
+        self.assertTrue(_proxy_endpoint_allowed("proxy.example", 443, any_port))
+        self.assertTrue(_proxy_endpoint_allowed("proxy.example", 8443, any_port))
+        self.assertTrue(_proxy_endpoint_allowed("PROXY.EXAMPLE", 3128, exact))
+        self.assertFalse(_proxy_endpoint_allowed("proxy.example", 8443, exact))
+        self.assertFalse(_proxy_endpoint_allowed("other.example", 3128, exact))
+        self.assertFalse(_proxy_endpoint_allowed("", 3128, any_port))
+
+    def test_redaction_strips_userinfo(self):
+        self.assertEqual(
+            _redact_proxy_display("http://user:secret@proxy.example:3128"),
+            "http://***@proxy.example:3128",
+        )
+        self.assertEqual(
+            _redact_proxy_display("proxy.example:3128"),
+            "proxy.example:3128",
+        )
+
+    def test_redaction_strips_userinfo_even_with_at_in_password(self):
+        # rsplit, not split: everything up to the last "@" is userinfo, so a
+        # password containing "@" cannot leak its tail into the display.
+        self.assertEqual(
+            _redact_proxy_display("http://user:p@ss@proxy.example:3128"),
+            "http://***@proxy.example:3128",
+        )
+        self.assertEqual(
+            _redact_proxy_display("user:p@ss@proxy.example:3128"),
+            "***@proxy.example:3128",
+        )
+
+    def test_malformed_approval_entry_error_is_redacted(self):
+        with self.assertRaises(ValueError) as ctx:
+            _parse_approved_proxy_entries(["http://user:secret@proxy.example:notaport"])
+
+        message = str(ctx.exception)
+        self.assertIn("invalid", message.lower())
+        self.assertIn(HTTPS_PROXY_ALLOW_ENV, message)
+        self.assertNotIn("secret", message)
+        self.assertNotIn("user", message)
+        self.assertIn("proxy.example:notaport", message)
+
+    def test_valid_approval_entry_with_credentials_is_accepted(self):
+        # Credentials in an approval entry are ignored for endpoint matching
+        # (urllib dials host:port regardless), and must not break parsing.
+        self.assertEqual(
+            _parse_approved_proxy_entries(["http://user:secret@proxy.example:3128"]),
+            [("http", "proxy.example", 3128)],
+        )
+
+
+class TestTunnelProxyApproval(unittest.TestCase):
+    """
+    Phase B: opening a CONNECT tunnel re-checks proxy approval at the
+    connection layer, so no code path can tunnel through an unapproved proxy
+    even if detection in download_file were ever bypassed or the environment
+    changed after validation.
+    """
+
+    PUBLIC_PROXY = "93.184.216.34:8443"  # example.com, public literal
+
+    def _connection(self, allowed_proxies=None):
+        conn = SafeHTTPSConnection(
+            self.PUBLIC_PROXY,
+            allowed_hosts=set(DEFAULT_ALLOWED_HOSTS),
+            allowed_domains=set(DEFAULT_ALLOWED_DOMAINS),
+            allowed_proxies=allowed_proxies,
+        )
+        conn.set_tunnel("huggingface.co", 443)
+        conn._context = MagicMock()
+        return conn
+
+    def test_tunnel_without_approval_blocked(self):
+        conn = self._connection()
+        with patch("socket.getaddrinfo") as mock_gai, \
+             patch("socket.create_connection") as mock_create_conn:
+            with self.assertRaises(ValueError) as ctx:
+                conn.connect()
+
+        message = str(ctx.exception)
+        self.assertIn("unapproved", message.lower())
+        self.assertIn(HTTPS_PROXY_ALLOW_ENV, message)
+        # Refused before any DNS lookup or socket activity.
+        mock_gai.assert_not_called()
+        mock_create_conn.assert_not_called()
+
+    def test_tunnel_with_wrong_approved_endpoint_blocked(self):
+        conn = self._connection(allowed_proxies=["other.example:3128"])
+        with patch("socket.getaddrinfo") as mock_gai:
+            with self.assertRaises(ValueError) as ctx:
+                conn.connect()
+
+        self.assertIn("unapproved", str(ctx.exception).lower())
+        mock_gai.assert_not_called()
+
+    def test_tunnel_with_wrong_approved_port_blocked(self):
+        conn = self._connection(allowed_proxies=["93.184.216.34:9443"])
+        with self.assertRaises(ValueError) as ctx:
+            conn.connect()
+
+        self.assertIn("unapproved", str(ctx.exception).lower())
+
+    def test_tunnel_with_portless_approval_allowed(self):
+        conn = self._connection(allowed_proxies=["93.184.216.34"])
+        with patch("socket.getaddrinfo") as mock_gai, \
+             patch("http.client.HTTPSConnection.connect") as mock_super_connect:
+            mock_gai.return_value = [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+            ]
+            conn.connect()
+
+        # Approval passed, addresses validated, then the tunnel was opened.
+        self.assertTrue(mock_gai.called)
+        mock_super_connect.assert_called_once()
+
+    def test_private_proxy_rejected_even_when_destination_allowlisted(self):
+        conn = SafeHTTPSConnection(
+            "10.0.0.5:3128",
+            allowed_hosts=set(DEFAULT_ALLOWED_HOSTS) | {"10.0.0.5"},
+            allowed_domains=set(DEFAULT_ALLOWED_DOMAINS),
+            allowed_proxies=["10.0.0.5:3128"],
+        )
+        conn.set_tunnel("huggingface.co", 443)
+        conn._context = MagicMock()
+        with self.assertRaises(ValueError) as ctx:
+            conn.connect()
+
+        self.assertIn(
+            "refusing proxy connection to local or private address",
+            str(ctx.exception).lower(),
+        )
+
+    def test_tunnel_dials_the_validated_proxy_address(self):
+        # The proxy name is resolved once, validated, and the socket is pinned
+        # to that address: super().connect() must not re-resolve the name
+        # (DNS rebinding TOCTOU between validation and dial).
+        conn = SafeHTTPSConnection(
+            "proxy.example.org:3128",
+            allowed_hosts=set(DEFAULT_ALLOWED_HOSTS),
+            allowed_domains=set(DEFAULT_ALLOWED_DOMAINS),
+            allowed_proxies=["proxy.example.org:3128"],
+        )
+        conn.set_tunnel("huggingface.co", 443)
+        conn._context = MagicMock()
+        with patch("socket.getaddrinfo") as mock_gai, \
+             patch("socket.create_connection") as mock_create_conn, \
+             patch("http.client.HTTPConnection._tunnel"):
+            mock_gai.return_value = [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 3128))
+            ]
+            conn.connect()
+
+        mock_create_conn.assert_called_once()
+        self.assertEqual(mock_create_conn.call_args[0][0], ("93.184.216.34", 3128))
+
+    def test_phase_a_bypass_grants_no_authorization_for_a_later_tunnel(self):
+        # Phase A saw the destination bypassed (NO_PROXY) and therefore
+        # granted nothing; a later request that is not covered -- a redirect
+        # hop, or an environment swapped after validation -- must still be
+        # refused at CONNECT time.
+        with _proxy_env(
+            HTTPS_PROXY="http://proxy.example:3128",
+            NO_PROXY="huggingface.co",
+        ):
+            entries = _enforce_proxy_policy("huggingface.co")
+        self.assertEqual(entries, [])
+
+        conn = SafeHTTPSConnection(
+            self.PUBLIC_PROXY,
+            allowed_hosts=set(DEFAULT_ALLOWED_HOSTS),
+            allowed_domains=set(DEFAULT_ALLOWED_DOMAINS),
+            allowed_proxies=entries,
+        )
+        conn.set_tunnel("redirect.example.org", 443)
+        with patch("socket.getaddrinfo") as mock_gai, \
+             patch("socket.create_connection") as mock_create_conn:
+            with self.assertRaises(ValueError) as ctx:
+                conn.connect()
+
+        self.assertIn("unapproved", str(ctx.exception).lower())
+        # Refused before any DNS lookup or socket activity.
+        mock_gai.assert_not_called()
+        mock_create_conn.assert_not_called()
+
+    def test_proxy_appearing_after_phase_a_is_refused_at_connect(self):
+        # Phase A ran while the environment had no proxy (nothing to
+        # authorize); a proxy that appears before the connection opens is
+        # refused with the approval state captured at Phase A.
+        with _proxy_env():
+            entries = _enforce_proxy_policy("huggingface.co")
+        self.assertEqual(entries, [])
+
+        with _proxy_env(HTTPS_PROXY="http://93.184.216.34:8443"):
+            conn = SafeHTTPSConnection(
+                self.PUBLIC_PROXY,
+                allowed_hosts=set(DEFAULT_ALLOWED_HOSTS),
+                allowed_domains=set(DEFAULT_ALLOWED_DOMAINS),
+                allowed_proxies=entries,
+            )
+            conn.set_tunnel("huggingface.co", 443)
+            with patch("socket.getaddrinfo") as mock_gai:
+                with self.assertRaises(ValueError) as ctx:
+                    conn.connect()
+
+        self.assertIn("unapproved", str(ctx.exception).lower())
+        mock_gai.assert_not_called()
+
+    def test_tunnel_tls_is_validated_against_the_destination(self):
+        # TLS inside the tunnel must verify the *destination's* certificate,
+        # never the proxy's: server_hostname is the tunnelled host.
+        conn = self._connection(allowed_proxies=[self.PUBLIC_PROXY])
+        with patch("socket.getaddrinfo") as mock_gai, \
+             patch("socket.create_connection") as mock_create_conn, \
+             patch("http.client.HTTPConnection._tunnel"):
+            mock_gai.return_value = [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+            ]
+            mock_create_conn.return_value = MagicMock()
+            conn.connect()
+
+        conn._context.wrap_socket.assert_called_once()
+        kwargs = conn._context.wrap_socket.call_args.kwargs
+        self.assertEqual(kwargs.get("server_hostname"), "huggingface.co")
+        self.assertNotEqual(kwargs.get("server_hostname"), conn.host)
 
 
 if __name__ == "__main__":

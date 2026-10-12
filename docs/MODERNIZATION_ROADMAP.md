@@ -3,7 +3,7 @@
 Repository: https://github.com/WURAlex/Fooocus-Modern.git
 Development branch: `modern-platform`
 Document created: 2026-10-12 (independent inspection, read-only)
-Last updated: 2026-10-12 — Stage 2 repair session + Stage 3 validation tests (approved)
+Last updated: 2026-10-12 — Stage 2 repair session + Stage 3 validation tests (approved, committed as `90869ce`); fail-closed HTTPS proxy policy (approved follow-up, uncommitted)
 
 This document records the original 14-stage modernization plan, the acceptance
 criteria for each stage, **independently verified** progress, unresolved issues,
@@ -37,16 +37,16 @@ on a GPU. **No GPU test has been run as of this document's creation.**
 |---|---|
 | Primary checkout | `/home/alex/Fooocus-Modern` |
 | Current branch | `feature/harden-model-downloader` (note: not `modern-platform`) |
-| HEAD | `4fae360 Harden launcher and model downloads` |
-| Primary working tree | ` M modules/model_loader.py`, `?? tests/test_model_loader.py`, `?? docs/MODERNIZATION_ROADMAP.md` — **nothing committed** |
-| `modern-platform`, `origin/modern-platform` | both `4fae360` (identical to HEAD) |
+| HEAD | `90869ce security: harden model downloader and add TLS regression tests` (parent `4fae360`, approved commit) |
+| Primary working tree | ` M modules/model_loader.py`, ` M tests/test_model_loader.py`, ` M docs/MODERNIZATION_ROADMAP.md` — the approved fail-closed HTTPS proxy policy plus its final integration verification, **not committed** (awaiting approval) |
+| `modern-platform`, `origin/modern-platform` | both `4fae360`; the local branch is 1 ahead — **not pushed** |
 | Stashes | none |
 | Second worktree | `/home/alex/.gemini/antigravity/worktrees/Fooocus-Modern/harden_model_downloader`, branch `harden_model_downloader`, HEAD `4fae360`, **2 uncommitted artifacts** (see §3) — untouched by the repair session, still ` M ` + `??` |
-| Commit history | `ae05379` (upstream baseline) → `3c8b447 docs: establish Fooocus Modern baseline` → `4fae360 Harden launcher and model downloads` |
+| Commit history | `ae05379` (upstream baseline) → `3c8b447 docs: establish Fooocus Modern baseline` → `4fae360 Harden launcher and model downloads` → `90869ce security: harden model downloader and add TLS regression tests` |
 | Tags | upstream only (`v2.4.1` … `v2.5.5`); no modernization tag |
 | CI | `.github/workflows/build_container.yml` (Docker build only). **No test/CI workflow exists.** |
 | Test environment | Python 3.14.4, `torch` not installed, `numpy` not installed; no dependencies installed during inspection |
-| Test results (2026-10-12, post-repair) | `python3 -m unittest tests.test_model_loader` → **Ran 85 — OK** (3 consecutive runs); `discover -s tests` → Ran 87 — 1 error (`tests/test_utils` needs `numpy`) |
+| Test results (2026-10-12, post-repair + proxy policy + final verification) | `python3 -m unittest tests.test_model_loader` → **Ran 132 — OK** (3 consecutive runs); `discover -s tests` → Ran 134 — 1 error (`tests/test_utils` needs `numpy`) |
 
 ---
 
@@ -258,6 +258,155 @@ and proven against the pre-repair code. **Recommended status: VERIFIED COMPLETE
 (pending your sign-off).** Remaining risks are recorded in §7 (deferred), none
 of them opened by this work.
 
+### Stage 2 (continued 2) — fail-closed HTTPS proxy policy (2026-10-12, approved follow-up)
+
+Authorized by the maintainer after the Stage 2/3 commit: reject proxy use by
+default, detect proxies with urllib's own selection rules, authorize via
+`FOOOCUS_ALLOWED_HTTPS_PROXIES` (separate from the destination allowlist),
+validate approved endpoints and their resolved IPs, add regression tests, run
+all downloader security tests, update this document; no commit/push/merge/tag,
+no Stage 4.
+
+**a) Detection mirrors urllib (verified empirically against
+`urllib.request`, Python 3.14).** `_configured_https_proxy()` makes the same
+API calls `ProxyHandler` makes — `getproxies()` + `proxy_bypass(host)`:
+
+| Environment | urllib behaviour for `https://` requests (probed) | Gate |
+|---|---|---|
+| `HTTPS_PROXY` / `https_proxy` | dials the **proxy** and issues `CONNECT` (`_tunnel_host` set) | **requires approval** |
+| `HTTP_PROXY` only | dials the destination directly (the `http` key is never consulted for https) | not gated (cannot cause a tunnel) |
+| `ALL_PROXY` / `FTP_PROXY` | dials the destination directly (same reason) | not gated |
+| `NO_PROXY` covering the destination | bypass → direct | not gated (mirrors urllib) |
+| `REQUEST_METHOD` (CGI) present | does **not** drop the `https` key (only `http`) | unchanged |
+
+Port inference matches urllib exactly: an explicit port wins, otherwise the
+connection defaults to **443** (probed: `HTTPS_PROXY=http://proxy.example` and
+schemeless `proxy.example` both dial port 443).
+
+**b) Two-phase enforcement:**
+
+- **Phase A — pre-flight in `download_file`** (`_enforce_proxy_policy`,
+  runs immediately after `_validate_url`, before any lock, temp file or
+  destination DNS): approval check → private/local check → public-IP
+  resolution of the proxy. Unparseable proxy URLs and malformed approval
+  entries both fail closed; proxy credentials are redacted from every error
+  message.
+- **Phase B — defense in depth at `CONNECT` time**
+  (`SafeHTTPSConnection.connect`, new `allowed_proxies` plumbed through
+  `SafeHTTPSHandler`): the tunnel branch re-checks approval first, then the
+  private check, then DNS validation, then the destination checks from the
+  Stage 2 repair. This catches any detection gap (e.g. the environment
+  changing after Phase A). The proxy socket is now **pinned to the validated
+  IP** (`_create_connection` override), closing the validate-then-re-resolve
+  TOCTOU on the proxy name itself; TLS still validates against
+  `_tunnel_host` (the destination), so certificate checks are unaffected.
+
+**c) Authorization rules:**
+
+- `FOOOCUS_ALLOWED_HTTPS_PROXIES` = comma-separated entries: `host`,
+  `host:port`, `scheme://host:port` (credentials allowed, ignored for
+  matching — host:port is the authorization unit because urllib issues the
+  same CONNECT regardless of scheme, probed). An entry without a port matches
+  any port on that host; with a port it must match exactly. Empty/unset →
+  nothing is approved.
+- Approval is **independent of the destination allowlist**: a destination
+  host authorized via `FOOOCUS_ALLOWED_DOWNLOAD_HOSTS` gains no proxy rights
+  (`test_destination_allowlist_does_not_authorize_proxy`).
+- **Private/local proxy endpoints are rejected even when approved** and even
+  when their address is destination-allowlisted (the previous
+  `allowed_hosts` escape hatch for private proxies was removed — it
+  contradicted requirement 4). Corporate proxies on private networks are
+  intentionally unsupported; tunnel through an endpoint you can authorize.
+
+**d) Tests (35 new in this round; suite 120 at this point — final totals in g):** `TestFailClosedProxyPolicy` (14: unapproved
+blocked before any network, destination-allowlist independence, approved path
+green, portless/port-mismatch matching, credential redaction, approved-private
+blocked, approved-DNS-private blocked with only the proxy resolved,
+unparseable proxy, malformed approval entry, `NO_PROXY` bypass, `HTTP_PROXY`/
+`ALL_PROXY` inertness), `TestProxyDetectionMirrorsUrllib` (8, selection-rule
+table above), `TestProxyEndpointParsing` (7: parse + approval matching rules),
+`TestTunnelProxyApproval` (5: Phase B fail-closed without/wrong approval,
+portless approval, destination-allowlist private proxy still rejected,
+validated-IP pinning). The 9 pre-existing proxy tests were *upgraded* (pass
+`allowed_proxies` explicitly) so their address-validation assertions still
+execute past the new approval gate — no assertion weakened.
+
+**e) Results of the proxy-policy round (executed 2026-10-12; superseded for
+current counts by g below):**
+
+| Check | Result |
+|---|---|
+| `python3 -m unittest tests.test_model_loader` | **Ran 120 — OK** (×3 consecutive) |
+| `discover -s tests` | Ran 122 — 1 error (`tests/test_utils` needs `numpy`, pre-existing) |
+| security subset (proxy + rebinding + TLS classes, 64 tests) | **64 — OK** |
+| `/tmp/opencode/verify_before_after.py` | pre-repair: **7 VULNERABLE**/2 blocked; current: **9/9 BLOCKED, 0 VULNERABLE** (new check #9: unapproved env `HTTPS_PROXY` blocks the download) |
+| live env (real `HTTPS_PROXY=http://93.184.216.34:8443`, no mocks) | `BLOCKED: Refusing to use unapproved HTTPS proxy … FOOOCUS_ALLOWED_HTTPS_PROXIES …`; no temp file created; `HTTP_PROXY` alone → detection returns `None` |
+| dependencies / TLS / git-self-update scans | unchanged (no dependency edits; no TLS bypass; no self-update code) |
+
+**f) Acceptance assessment:** every approved requirement implemented, tested
+and demonstrated live. Remaining proxy risks are recorded in §7.2 (#1 trust
+boundary, #2 private-proxy constraint).
+
+**g) Final integration verification (2026-10-12, approved review round).**
+All nine verification points re-checked against the finished implementation;
+three defects were found, fixed, and covered by regression tests:
+
+| # | Point | Verdict |
+|---|---|---|
+| 1 | Detection parity with urllib | **PROVEN** — external probe (`/tmp/opencode/probe_parity_final.py`) compares the gate against urllib's *actual dial decision* (sentinel `socket.create_connection`, per-case opener rebuild): **22/22 cases agree, 0 mismatches**; plus in-suite oracle matrix (fresh `ProxyHandler` per case, 20 subtests) |
+| 2 | Python-version consistency | **PROVEN** — no declared `python_requires`/`requires-python` anywhere, no `sys.version_info` guards; CPython 3.10 vs 3.14 sources compared: `http/client.py` (instance-level `_create_connection`, `server_hostname = self._tunnel_host` when tunnelled) and `urllib/request.py` (two-pass `getproxies_environment`, CGI `REQUEST_METHOD` pops only `http`, `proxy_bypass_environment`, `_parse_proxy` schemeless-authority branch, `set_proxy`/`_tunnel_host`) are semantically identical → no version-dependent behavior. The raw-`urlopen` `download_file` in `ldm_patched/k_diffusion/utils.py` has **zero callers** (dead code, recorded in §7.2 #5) |
+| 3 | `NO_PROXY` safety | **PROVEN** — bypass cases in probe + matrix (exact, dot-suffix, `*`, port-qualified, portless-vs-port); see D3 below |
+| 4 | Redirect cannot bypass the gate | **PROVEN** — 7 existing `TestHardenedRedirectHandler` cases (https-only, trusted-host, SSRF, loops) + new composition test: a Phase A that bypassed via `NO_PROXY` grants **no** approval for a later tunnel, refused at CONNECT before any DNS/socket |
+| 5 | Credentials never leak | **DEFECT D1/D2 found and fixed** — approval-entry errors now redacted (`_redact_proxy_display`), and redaction uses `rsplit("@")` so a password containing `@` cannot leak its tail; covered by e2e + unit tests |
+| 6 | TLS inside the tunnel | **PROVEN + new tests** — new test asserts `wrap_socket(server_hostname="huggingface.co")` (destination, never the proxy) and that the default `SafeHTTPSConnection` context stays `CERT_REQUIRED` + `check_hostname` |
+| 7 | Direct-path pinning | **PROVEN** — existing named tests `test_safe_https_connection_direct_connects_to_validated_ip` (dials the pre-validated IP, `server_hostname` = destination) and `test_tunnel_dials_the_validated_proxy_address` (proxy dial pinned) |
+| 8 | Environment change after Phase A | **PROVEN + new test** — a proxy appearing after Phase A is refused at CONNECT using the approval state captured at Phase A (no DNS, no socket) |
+| 9 | No dependency/TLS/self-update regressions | **PROVEN** — `git diff` touches only the 3 approved files; no dependency files changed; TLS-bypass source scan green in-suite; repo grep shows no `pygit2`/`git pull`/self-update code; harness **9/9 BLOCKED, 0 VULNERABLE**; live unmocked `HTTPS_PROXY=http://93.184.216.34:8443` blocked with no residual file |
+
+**Defects found in this round (all fixed):**
+
+- **D1** — `_parse_approved_proxy_entries` echoed the raw approval entry
+  (`{entry!r}`) in its error; an approval entry may itself carry credentials
+  (`scheme://user:pass@host:port`), which would land in logs/consoles. Fixed:
+  message now passes the entry through `_redact_proxy_display`.
+- **D2** — `_redact_proxy_display` used `split("@", 1)`, so a password
+  containing `@` leaked its tail (`***@ss@host`). Fixed: `rsplit("@", 1)`
+  (everything up to the last `@` is userinfo).
+- **D3** — Phase A passed `urlparse(url).hostname` (**port stripped**) to
+  `proxy_bypass`, while urllib compares `NO_PROXY` against `Request.host`,
+  which keeps an explicit URL port. With `HTTPS_PROXY` set,
+  `NO_PROXY=huggingface.co:443` and URL `https://huggingface.co:443/…` urllib
+  goes direct but the old gate refused (false-positive block; fail-closed
+  direction, but not the claimed parity). Fixed: the gate now receives
+  `urlparse(url).netloc` (userinfo is impossible there — `_validate_url`
+  rejected it earlier), exactly as `Request.host` carries it. Proof:
+  `proxy_bypass("huggingface.co")` → `False` vs
+  `proxy_bypass("huggingface.co:443")` → `True` for that env, and the probe's
+  `URL:443 NO_PROXY:443` / `URL:8443 NO_PROXY:8443` cases now agree.
+
+**Final counts (executed 2026-10-12):**
+
+| Check | Result |
+|---|---|
+| `python3 -m unittest tests.test_model_loader` | **Ran 132 — OK** (3 consecutive; +12 tests over the policy round) |
+| `discover -s tests` | Ran 134 — 1 error (`tests/test_utils` needs `numpy`, pre-existing) |
+| security subset (12 URL/redirect/rebinding/TLS/proxy classes, 101 tests) | **101 — OK** |
+| `tests.test_extra_utils` | 1 — OK |
+| parity probe (external, real urllib dial oracle) | **22/22 agree, 0 mismatches** |
+| `/tmp/opencode/verify_before_after.py` | **9/9 BLOCKED, 0 VULNERABLE** |
+| live unapproved `HTTPS_PROXY` (no mocks) | `BLOCKED … FOOOCUS_ALLOWED_HTTPS_PROXIES …`, no residual file |
+| `py_compile` | OK |
+
+New regression tests: `test_gate_agrees_with_urllib_on_every_selection_case`
+(20 subtests incl. all port-qualified `NO_PROXY` forms), D3 e2e pair
+(`test_no_proxy_entry_with_port_matches_url_with_port`,
+`test_no_proxy_entry_for_unlisted_port_does_not_bypass`),
+`test_approval_entry_credentials_never_leak_into_errors` + 4 redaction/
+approval-parsing units, `test_phase_a_bypass_grants_no_authorization_for_a_later_tunnel`,
+`test_proxy_appearing_after_phase_a_is_refused_at_connect`,
+`test_tunnel_tls_is_validated_against_the_destination`,
+`test_safe_https_connection_context_requires_verification`.
+
 ### Stage 3 — Remove TLS verification bypass completely — **VERIFIED COMPLETE (code); test missing**
 
 Historical status said "not yet completed"; inspection contradicts that:
@@ -367,7 +516,7 @@ will be committed or tagged without explicit approval.
 | # | Stage | Status |
 |---|---|---|
 | 1 | Remove Git self-update | **VERIFIED COMPLETE** |
-| 2 | Harden model downloader | **VERIFIED COMPLETE — pending sign-off** (2026-10-12 repair): 2 HIGH + 4 MEDIUM findings fixed and proven against the pre-repair code; **85/85 tests green ×3**; original worktree artifacts preserved |
+| 2 | Harden model downloader | **VERIFIED COMPLETE — pending sign-off** (2026-10-12 repair, committed as `90869ce`): 2 HIGH + 4 MEDIUM findings fixed and proven against the pre-repair code; **plus approved follow-up: fail-closed HTTPS proxy policy** (uncommitted): proxy use rejected by default, urllib-mirrored detection, `FOOOCUS_ALLOWED_HTTPS_PROXIES` authorization separate from the destination allowlist, two-phase enforcement with IP pinning, **plus final integration verification** (9/9 points, 3 defects fixed, probe 22/22); **132/132 tests green ×3**; original worktree artifacts preserved |
 | 3 | Remove TLS verification bypass | **VERIFIED COMPLETE** — bypass-free source scan + runtime context assertions + live handshake accept/reject tests; no dependency changed |
 | 4 | Modernize Python/PyTorch/CUDA | NOT STARTED (blocked: Stages 2/3 sign-off) |
 | 5 | Modernize Gradio | NOT STARTED |
@@ -384,8 +533,9 @@ will be committed or tagged without explicit approval.
 **Verified vs reported:** Stages 1, 2 and 3 now carry independently executed
 evidence in this document. Stage 2's previous "43 tests passed" claim remains
 **not reproducible** as stated (the suite was 54 tests / 4 red before the
-approved repair; it is now 85 tests / 0 red). No other stage has any evidence
-behind it.
+approved repair; it is now 132 tests / 0 red after the repair, the
+fail-closed proxy policy, and the final integration verification). No other
+stage has any evidence behind it.
 
 ---
 
@@ -403,31 +553,47 @@ behind it.
 | 6 | MED: `100.64.0.0/10` and other special-use ranges unblocked | **fixed** (`_NON_PUBLIC_NETWORKS`, `not is_global`, NAT64/6to4 embedded-IPv4) |
 | 7 | Test defects: thread-unsafe `patch`, missing `__enter__`, `.lock` assertions | **fixed** (no security assertion weakened) |
 | 8 | Work not present in the primary checkout | **transferred safely**, worktree originals preserved |
+| 9 | Proxy policy follow-up: ambient `HTTPS_PROXY` silently proxied downloads; private proxies could be unlocked via the destination `allowed_hosts`; proxy name validated then re-resolved at dial time | **fixed** (fail-closed two-phase approval via `FOOOCUS_ALLOWED_HTTPS_PROXIES`, private proxies always rejected, dial pinned to the validated IP) + 35 tests |
+| 10 | Final-review defects: approval-entry credentials echoed in errors; `rsplit`-style redaction split at the *first* `@`; Phase A passed a port-stripped hostname to `proxy_bypass` (diverged from `Request.host` for port-qualified `NO_PROXY`) | **fixed** + 12 regression tests (parity matrix, D3 e2e pair, redaction units, Phase B compositions) |
 
 ### 7.2 Remaining risks (open, reviewed and accepted for now)
 
-1. **Proxy TOCTOU (documented limitation).** With `HTTPS_PROXY` set, our process
-   validates the destination *before* opening the tunnel, but the proxy performs
-   its own resolution afterwards. A proxy you do not control can re-point the
-   connection. Fail-closed behaviour is implemented (target must validate, proxy
-   must validate, DNS failure aborts); the residual risk cannot be removed
-   client-side. **Only use proxies you control.** Documented in the
+1. **Proxy trust boundary (documented limitation, narrowed by the proxy
+   policy).** Proxy use now requires explicit approval via
+   `FOOOCUS_ALLOWED_HTTPS_PROXIES` (fail closed) and both the proxy and the
+   destination are validated before the tunnel opens; the proxy's own socket
+   is pinned to the validated IP (no client-side re-resolution). What remains:
+   `CONNECT` sends the destination *hostname*, so an **approved** proxy
+   performs its own resolution afterwards and can re-point the connection —
+   this cannot be removed client-side. TLS still validates the destination
+   certificate, so an untrusted proxy cannot forge the session, only
+   observe/refuse/route it. **Only approve proxies you control** (proxy
+   approval delegates destination resolution to them). Documented in the
    `SafeHTTPSConnection` docstring.
-2. **Private proxies by hostname are refused** unless explicitly listed in
-   `allowed_hosts` (e.g. `FOOOCUS_ALLOWED_DOWNLOAD_HOSTS`). Intentional fail-closed
-   behaviour; an operator behind a corporate proxy must opt in.
+2. **Private/local proxy endpoints are refused unconditionally** — even when
+   approved via `FOOOCUS_ALLOWED_HTTPS_PROXIES` and even when the address
+   appears in the destination allowlist (the old `allowed_hosts` escape hatch
+   was removed in the proxy-policy follow-up because it mixed proxy and
+   destination authorization). An operator whose proxy lives on a private
+   network has no opt-in; route through a public endpoint instead. Intentional
+   fail-closed behaviour; tests assert it on both enforcement phases.
 3. **`DEFAULT_MAX_DURATION=1800 s` may abort a legitimate slow 6–10 GB download**
    — product decision needed before Stage 4/7. The deadline is now genuinely
    total, so this is more visible than before.
 4. **No `fsync` before `os.replace`** — a power loss can leave a truncated model
    file that still passes the *hash* check only if `expected_hash` was supplied
    (today: 0/30 call sites, see Stage 7). Fix belongs with Stage 7 integrity work.
-5. **`extras/facexlib/utils/misc.py` still calls `torch.hub.download_url_to_file`**
-   → bypasses the hardened downloader and hashes nothing (`hash_prefix=None`).
+5. **Alternate download paths bypass the hardened downloader.**
+   `extras/facexlib/utils/misc.py` still calls
+   `torch.hub.download_url_to_file` → hashes nothing (`hash_prefix=None`).
+   Likewise `ldm_patched/k_diffusion/utils.py::download_file` uses raw
+   `urllib.request.urlopen` (env-proxy aware, no SSRF/approval hardening) —
+   verified in the final review to have **zero callers** anywhere in the repo
+   (dead code): no live exposure, remove it during Stage 7 cleanup.
 6. **`tests/test_utils.py` needs `numpy`** → `discover -s tests` can never be
    fully green in a clean environment (dependency installs are forbidden until
    Stage 4 is authorized).
-7. **No CI test workflow** — the 85 tests only run when someone runs them.
+7. **No CI test workflow** — the 132 tests only run when someone runs them.
 
 ### 7.3 Deferred improvements (not defects of this session)
 
@@ -465,31 +631,43 @@ behind it.
    rejection checks; no dependency upgraded.
 10. ✅ This document updated with verified results (§5 Stage 2/Stage 3
     continuations, §6, §7).
+11. ✅ Fail-closed HTTPS proxy policy (approved follow-up): urllib-mirrored
+    detection, `FOOOCUS_ALLOWED_HTTPS_PROXIES` authorization kept
+    separate from the destination allowlist (§5 Stage 2 continued 2), two-phase
+    enforcement with validated-IP pinning, live unapproved-proxy proof,
+    before/after harness 9/9 blocked — **plus the approved final integration
+    verification** (all 9 points; 3 defects D1–D3 found/fixed; parity probe
+    22/22; **47 new tests total, suite 132/132 ×3**). Changes to
+    `modules/model_loader.py`, `tests/test_model_loader.py` and this document
+    are **staged (`git add`), not committed — awaiting approval**.
 
 **P0 — your decision required next**
 
-11. Review §5 Stage 2 (continued), §5 Stage 3 (continued), §7.2 and sign off
-    Stage 2/Stage 3, or name the items to rework.
-12. Approve staging/committing the three files
-    (`modules/model_loader.py`, `tests/test_model_loader.py`,
-    `docs/MODERNIZATION_ROADMAP.md`) onto `feature/harden-model-downloader` and
-    the merge into `modern-platform`. Nothing has been staged or committed yet.
-13. Decide on §7.2 #3 (30-minute deadline vs. multi-GB downloads).
+12. Review §5 Stage 2 (continued), §5 Stage 2 (continued 2), §5 Stage 3
+    (continued), §7.2 and sign off Stages 2/3 (including the proxy policy), or
+    name the items to rework.
+13. Approve committing the proxy-policy + final-verification changes to
+    `modules/model_loader.py`, `tests/test_model_loader.py` and
+    `docs/MODERNIZATION_ROADMAP.md` on `feature/harden-model-downloader`
+    (the Stage 2/3 work is already committed as `90869ce`; the three approved
+    files are **staged, not committed**, and no push/merge/tag has been
+    performed).
+14. Decide on §7.2 #3 (30-minute deadline vs. multi-GB downloads).
 
 **P1 — after Stage 2 sign-off**
 
-14. Stage 7 groundwork: build a model manifest with SHA-256 for every download
+15. Stage 7 groundwork: build a model manifest with SHA-256 for every download
     URL (30 call sites) and start passing `expected_hash`; route
     `extras/facexlib/utils/misc.py` through the hardened downloader; add
     `fsync` before `os.replace`.
-15. Stage 8: audit `modules/launch_util.py` subprocess execution, network call
+16. Stage 8: audit `modules/launch_util.py` subprocess execution, network call
     sites, and any residual update behavior.
-16. Add a CI workflow running `python3 -m unittest discover -s tests` (after
+17. Add a CI workflow running `python3 -m unittest discover -s tests` (after
     deciding how `tests/test_utils.py` gets `numpy`).
 
 **P2 — after Stages 3/7/8**
 
-17. Stage 4 (Python/PyTorch/CUDA), Stage 5 (Gradio), Stage 6 (notebook),
+18. Stage 4 (Python/PyTorch/CUDA), Stage 5 (Gradio), Stage 6 (notebook),
     Stage 9 (VRAM/GPU/Colab), Stage 10 (generation tests on a GPU),
     Stages 11–13 (validation, launcher, clean runtime), Stage 14 (commit/tag —
     with approval).
