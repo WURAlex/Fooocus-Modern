@@ -2,10 +2,30 @@ import cv2
 import os
 import os.path as osp
 import torch
-from torch.hub import download_url_to_file, get_dir
 from urllib.parse import urlparse
 
+from modules.model_manifest import (
+    ManifestError,
+    download as manifest_download,
+    match_url,
+)
+
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _torch_hub_checkpoints_dir():
+    """Replicates torch.hub.get_dir()/checkpoints without importing torch.hub.
+
+    torch 2.1 semantics: $TORCH_HOME/hub/checkpoints, where $TORCH_HOME
+    defaults to $XDG_CACHE_HOME/torch and $XDG_CACHE_HOME defaults to ~/.cache.
+    """
+    torch_home = os.path.expanduser(
+        os.getenv(
+            "TORCH_HOME",
+            os.path.join(os.getenv("XDG_CACHE_HOME", "~/.cache"), "torch"),
+        )
+    )
+    return os.path.join(torch_home, "hub", "checkpoints")
 
 
 def imwrite(img, file_path, params=None, auto_mkdir=True):
@@ -58,10 +78,15 @@ def img2tensor(imgs, bgr2rgb=True, float32=True):
 
 def load_file_from_url(url, model_dir=None, progress=True, file_name=None, save_dir=None):
     """Ref:https://github.com/1adrianb/face-alignment/blob/master/face_alignment/utils.py
+
+    P1-A: routes through the hardened downloader via the model-integrity
+    manifest (modules.model_manifest). Signature, cache-directory semantics,
+    and return value (absolute path) match the legacy implementation; the
+    legacy torch.hub transport is gone. URLs not recorded in the manifest are
+    refused (fail-closed).
     """
     if model_dir is None:
-        hub_dir = get_dir()
-        model_dir = os.path.join(hub_dir, 'checkpoints')
+        model_dir = _torch_hub_checkpoints_dir()
 
     if save_dir is None:
         save_dir = os.path.join(ROOT_DIR, model_dir)
@@ -71,11 +96,20 @@ def load_file_from_url(url, model_dir=None, progress=True, file_name=None, save_
     filename = os.path.basename(parts.path)
     if file_name is not None:
         filename = file_name
-    cached_file = os.path.abspath(os.path.join(save_dir, filename))
-    if not os.path.exists(cached_file):
-        print(f'Downloading: "{url}" to {cached_file}\n')
-        download_url_to_file(url, cached_file, hash_prefix=None, progress=progress)
-    return cached_file
+
+    entry = match_url(url)
+    if entry is None:
+        raise ManifestError(
+            f"Refusing download of a URL that is not recorded in the model "
+            f"integrity manifest: {url!r}"
+        )
+
+    return manifest_download(
+        entry["id"],
+        model_dir=save_dir,
+        file_name=filename,
+        progress=progress,
+    )
 
 
 def scandir(dir_path, suffix=None, recursive=False, full_path=False):
