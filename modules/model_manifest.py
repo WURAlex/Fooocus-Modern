@@ -236,7 +236,26 @@ def match_file_name_url(file_name: str, url: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def download(artifact_id: str, model_dir: str, file_name: Optional[str] = None) -> str:
+def match_url(url: str) -> Optional[Dict[str, Any]]:
+    """
+    Return the manifest entry (any status) whose pinned source URL equals `url`,
+    or None when the URL is not recorded in the manifest. Used by the legacy
+    facexlib wrapper, which is keyed by download URL rather than artifact id.
+    """
+    if not isinstance(url, str):
+        return None
+    for entry in load_manifest()["artifacts"]:
+        if entry["source"].get("url") == url:
+            return entry
+    return None
+
+
+def download(
+    artifact_id: str,
+    model_dir: str,
+    file_name: Optional[str] = None,
+    progress: bool = True,
+) -> str:
     """
     Download (or re-verify) a manifest artifact through the hardened downloader.
 
@@ -277,6 +296,7 @@ def download(artifact_id: str, model_dir: str, file_name: Optional[str] = None) 
         expected_hash=expected_hash,
         cached_hash_mismatch=cached_hash_mismatch,
         allowed_domains=entry.get("allowed_domains"),
+        progress=progress,
     )
 
 

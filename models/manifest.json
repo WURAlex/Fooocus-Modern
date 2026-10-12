@@ -630,8 +630,10 @@
       "evidence": ["https://api.github.com/repos/xinntao/facexlib/releases/tags/v0.1.0"],
       "mandatory": false,
       "user_substitutable": false,
-      "allow_unverified": false,
-      "note": "Still downloaded via the legacy facexlib torch.hub path (P1 will route through the hardened downloader).",
+      "allow_unverified": true,
+      "unverified_justification": "GitHub release API publishes no asset digest (digest: null, audited 2026-10-12); size_bytes comes from the same release-API evidence. Transport is restricted to the per-artifact GitHub allowlist (github.com -> release-assets.githubusercontent.com). SHA-256 pinning deferred until an authoritative digest source is established (HF mirror LFS OID or approval-gated one-time digest computation).",
+      "allowed_domains": ["github.com", "release-assets.githubusercontent.com"],
+      "note": "Routed through the hardened downloader via extras/facexlib/utils/misc.py (P1-A); remains unresolved until an authoritative SHA-256 source is established.",
       "call_sites": ["extras/facexlib/detection/__init__.py:11"]
     },
     {
@@ -653,8 +655,10 @@
       "evidence": ["https://api.github.com/repos/xinntao/facexlib/releases/tags/v0.1.0"],
       "mandatory": false,
       "user_substitutable": false,
-      "allow_unverified": false,
-      "note": "Still downloaded via the legacy facexlib torch.hub path (P1).",
+      "allow_unverified": true,
+      "unverified_justification": "GitHub release API publishes no asset digest (digest: null, audited 2026-10-12); size_bytes comes from the same release-API evidence. Transport is restricted to the per-artifact GitHub allowlist (github.com -> release-assets.githubusercontent.com). SHA-256 pinning deferred until an authoritative digest source is established (HF mirror LFS OID or approval-gated one-time digest computation).",
+      "allowed_domains": ["github.com", "release-assets.githubusercontent.com"],
+      "note": "Routed through the hardened downloader via extras/facexlib/utils/misc.py (P1-A); remains unresolved until an authoritative SHA-256 source is established.",
       "call_sites": ["extras/facexlib/detection/__init__.py:14"]
     },
     {
@@ -676,8 +680,10 @@
       "evidence": ["https://api.github.com/repos/xinntao/facexlib/releases/tags/v0.2.0"],
       "mandatory": false,
       "user_substitutable": false,
-      "allow_unverified": false,
-      "note": "Still downloaded via the legacy facexlib torch.hub path (P1).",
+      "allow_unverified": true,
+      "unverified_justification": "GitHub release API publishes no asset digest (digest: null, audited 2026-10-12); size_bytes comes from the same release-API evidence. Transport is restricted to the per-artifact GitHub allowlist (github.com -> release-assets.githubusercontent.com). SHA-256 pinning deferred until an authoritative digest source is established (HF mirror LFS OID or approval-gated one-time digest computation).",
+      "allowed_domains": ["github.com", "release-assets.githubusercontent.com"],
+      "note": "Routed through the hardened downloader via extras/facexlib/utils/misc.py (P1-A); remains unresolved until an authoritative SHA-256 source is established.",
       "call_sites": ["extras/facexlib/parsing/__init__.py:11"]
     },
     {
@@ -699,8 +705,10 @@
       "evidence": ["https://api.github.com/repos/xinntao/facexlib/releases/tags/v0.2.2"],
       "mandatory": false,
       "user_substitutable": false,
-      "allow_unverified": false,
-      "note": "Still downloaded via the legacy facexlib torch.hub path (P1).",
+      "allow_unverified": true,
+      "unverified_justification": "GitHub release API publishes no asset digest (digest: null, audited 2026-10-12); size_bytes comes from the same release-API evidence. Transport is restricted to the per-artifact GitHub allowlist (github.com -> release-assets.githubusercontent.com). SHA-256 pinning deferred until an authoritative digest source is established (HF mirror LFS OID or approval-gated one-time digest computation).",
+      "allowed_domains": ["github.com", "release-assets.githubusercontent.com"],
+      "note": "Routed through the hardened downloader via extras/facexlib/utils/misc.py (P1-A); remains unresolved until an authoritative SHA-256 source is established.",
       "call_sites": ["extras/facexlib/parsing/__init__.py:14"]
     },
     {

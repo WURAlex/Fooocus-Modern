@@ -469,7 +469,7 @@ subdirectory**, so the notebook fails at `%cd` before `launch.py` runs. It also
 performs no dependency pre-check, no GPU check, and no persistent-storage
 handling.
 
-### Stage 7 — Review model URLs and model integrity — **AUDIT COMPLETE, P0 IMPLEMENTED (awaiting sign-off)**
+### Stage 7 — Review model URLs and model integrity — **AUDIT COMPLETE, P0 + P1-A IMPLEMENTED (awaiting sign-off)**
 
 Full audit: **`docs/MODEL_INTEGRITY_AUDIT.md`** (branch `stage7-model-integrity-audit`,
 baseline `c4e8986`, audit date 2026-10-12). The P0 implementation landed in the
@@ -493,7 +493,8 @@ Audit findings (pre-P0 state, retained for history):
   `(file_name, url)` pair matches a verified entry, and cached files with a
   mismatched hash fail closed on manifest-driven downloads
   (`CachedFileIntegrityError`; explicit removal required to recover). The
-  legacy facexlib/BLIP-DeiT/rembg paths remain unenforced (P1).
+  legacy BLIP/DeiT/rembg paths remain unenforced; facexlib was migrated in
+  P1-A (below).
 - Identity status: **26 verified** (independently published SHA-256 via HF
   LFS OIDs), **unresolved: 8 audit categories = 14 manifest entries** (the
   rembg family is listed as 7 individual entries), **4 user-provided**
@@ -508,7 +509,11 @@ Audit findings (pre-P0 state, retained for history):
 - Legacy bypasses confirmed: facexlib downloads (`extras/facexlib/utils/misc.py:77`,
   `hash_prefix=None`), BLIP/DeiT via torch.hub (prefix-only `check_hash`),
   rembg internal downloader; dead raw-`urlopen` helper at
-  `ldm_patched/k_diffusion/utils.py:37`. **Still open (P1).**
+  `ldm_patched/k_diffusion/utils.py:37`. **P1-A resolved two of these
+  (2026-10-12): facexlib now routes through the manifest → hardened
+  downloader, and the dead k-diffusion helper is deleted. BLIP/DeiT and
+  rembg remain open (P1)** — see `docs/LEGACY_DOWNLOADER_MIGRATION_AUDIT.md`
+  §9.
 - Design (manifest schema, statuses `verified`/`unresolved`/
   `user-provided`, review/authentication process, P0–P3 plan with acceptance
   tests T1–T8) is specified in the audit doc §5 and §8; P0 results and
@@ -618,12 +623,13 @@ stage has any evidence behind it.
    file that still passes the *hash* check only if `expected_hash` was supplied
    (today: 0/30 call sites, see Stage 7). Fix belongs with Stage 7 integrity work.
 5. **Alternate download paths bypass the hardened downloader.**
-   `extras/facexlib/utils/misc.py` still calls
-   `torch.hub.download_url_to_file` → hashes nothing (`hash_prefix=None`).
-   Likewise `ldm_patched/k_diffusion/utils.py::download_file` uses raw
-   `urllib.request.urlopen` (env-proxy aware, no SSRF/approval hardening) —
-   verified in the final review to have **zero callers** anywhere in the repo
-   (dead code): no live exposure, remove it during Stage 7 cleanup.
+   ~~`extras/facexlib/utils/misc.py` still calls
+   `torch.hub.download_url_to_file`~~ — **resolved (P1-A)**: the wrapper now
+   delegates to `modules.model_manifest.download` → hardened loader, and
+   `ldm_patched/k_diffusion/utils.py::download_file` (zero callers) was
+   **deleted**. Remaining: the BLIP/DeiT torch.hub path (dead code) and
+   rembg's internal pooch downloader — see
+   `docs/LEGACY_DOWNLOADER_MIGRATION_AUDIT.md` §6.2/§6.3.
 6. **`tests/test_utils.py` needs `numpy`** → `discover -s tests` can never be
    fully green in a clean environment (dependency installs are forbidden until
    Stage 4 is authorized).
@@ -706,11 +712,38 @@ stage has any evidence behind it.
     GroundingDINO allowlist defect with per-artifact `allowed_domains`, added
     fail-closed cached-hash verification (`CachedFileIntegrityError`) and
     `tests/test_model_integrity.py` (36 tests incl. post-review corrections
-    L1/L2/L3/L5 — audit §11; suite 169/169 ×3). **Still
-    pending (P1):** route `extras/facexlib/utils/misc.py` and the BLIP/DeiT
-    torch.hub path through the hardened downloader, pre-download/rehash the
-    rembg family, delete the dead `ldm_patched` raw-`urlopen` helper, add
-    `fsync` before `os.replace`.
+    L1/L2/L3/L5 — audit §11; suite 169/169 ×3).
+    **P1-A implemented 2026-10-12 (uncommitted, awaiting review):** facexlib's
+    4 URLs now route through the manifest → hardened downloader with
+    per-artifact GitHub `allowed_domains` and Tier-2 `allow_unverified`
+    justifications (entries honestly left `unresolved`, no invented hashes);
+    the dead `ldm_patched` raw-`urlopen` `download_file` helper deleted;
+    `tests/test_p1_legacy_migration.py` added (33 tests, no-torch CI-safe);
+    Security CI run line extended — **suite 201/201 ×3 (3.10/3.12/3.14),
+    actionlint clean**. **Still pending (P1):** route the BLIP/DeiT
+    torch.hub path (or delete the dead module), pre-download/rehash the
+    rembg family, add `fsync` before `os.replace`, and the approval-gated
+    hash-tier downloads (facexlib Tier 1/3, rembg Tier B, BLIP full hash).
+    **P1 audit status (2026-10-12): audit + migration design COMPLETE;
+    P1-A (facexlib + dead helper + tests) IMPLEMENTED, BLIP/DeiT and rembg
+    untouched** — see `docs/LEGACY_DOWNLOADER_MIGRATION_AUDIT.md`
+    (branch `feature/stage7-legacy-downloaders` off baseline `9df2d33`,
+    uncommitted). Findings: facexlib's 4 URLs funnel through one legacy
+    wrapper (`extras/facexlib/utils/misc.py:59`, zero hash verification,
+    GitHub `digest: null` on all 4 release assets → hash tiers documented);
+    the BLIP/DeiT `load_state_dict_from_url` site is **dead code (zero
+    callers, static + dynamic scan)** and loads full pickle from a mutable
+    CDN with a download-time-only prefix check (torch 2.1.0); rembg 2.0.57
+    uses `pooch` with pinned **md5** into `$U2NET_HOME`/`~/.u2net` —
+    supported redirection via `U2NET_HOME` pre-seeding, no monkey-patch
+    recommended, `MODEL_CHECKSUM_DISABLED` banned by proposed scan test,
+    `pooch` itself unpinned;     `ldm_patched/k_diffusion/utils.py::download_file`
+    re-confirmed dead (module stays — `sampling.py:47` needs
+    `utils.append_dims`) and **deleted in P1-A**. All four migrations can
+    proceed **without downloading model weights** at the routing layer;
+    full-hash tiers are approval-gated downloads. P1-A (facexlib routing,
+    helper deletion, tests, CI extension) is implemented and awaiting
+    review; BLIP/DeiT and rembg await separate approval.
 16. Stage 8: audit `modules/launch_util.py` subprocess execution, network call
     sites, and any residual update behavior.
 17. ~~Add a CI workflow~~ — Security CI exists since PR #1 (`tests.test_model_loader`
