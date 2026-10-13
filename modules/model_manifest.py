@@ -18,6 +18,7 @@ STATUS_UNRESOLVED = "unresolved"
 
 _VALID_STATUSES = {STATUS_VERIFIED, STATUS_UNRESOLVED}
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_MD5_RE = re.compile(r"^[0-9a-f]{32}$")
 _HEX_PREFIX_RE = re.compile(r"^[0-9a-f]{4,64}$")
 # DNS hostnames: lowercase RFC-1123 labels joined by dots, <=253 chars.
 _DOMAIN_RE = re.compile(
@@ -134,7 +135,17 @@ def _validate_entry(entry: Any, position: int) -> None:
         raise ManifestError(f"{where}: source.url is required")
 
     sha256 = entry.get("sha256")
+    md5 = entry.get("md5")
+    if md5 is not None and not (
+        isinstance(md5, str) and _MD5_RE.match(md5.lower())
+    ):
+        raise ManifestError(f"{where}: md5 must be null or 32-hex")
     if entry["status"] == STATUS_VERIFIED:
+        if md5 is not None:
+            raise ManifestError(
+                f"{where}: verified (SHA-256) entries must not also declare md5; "
+                "mixed hash tiers are an ambiguous integrity classification"
+            )
         if not isinstance(sha256, str) or not _SHA256_RE.match(sha256.lower()):
             raise ManifestError(
                 f"{where}: verified entries require a 64-hex sha256"
@@ -156,6 +167,18 @@ def _validate_entry(entry: Any, position: int) -> None:
             isinstance(sha256, str) and _SHA256_RE.match(sha256.lower())
         ):
             raise ManifestError(f"{where}: sha256 must be null or 64-hex")
+        if md5 is not None:
+            if sha256 is not None:
+                raise ManifestError(
+                    f"{where}: entry must not declare both sha256 and md5; "
+                    "mixed hash tiers are an ambiguous integrity classification"
+                )
+            if entry.get("allow_unverified"):
+                raise ManifestError(
+                    f"{where}: md5-pinned entries must not set allow_unverified; "
+                    "an md5 pin is a trusted (weak) checksum, not an absence of "
+                    "one"
+                )
         if not isinstance(entry.get("allow_unverified"), bool):
             raise ManifestError(
                 f"{where}: unresolved entries require an allow_unverified flag"
@@ -259,8 +282,11 @@ def download(
     """
     Download (or re-verify) a manifest artifact through the hardened downloader.
 
-    verified       -> expected_hash enforced; cached-file mismatch fails closed.
-    unresolved     -> refused unless allow_unverified is set (warning printed).
+    verified          -> expected_hash enforced; cached-file mismatch fails closed.
+    unresolved + md5  -> md5 pin enforced (weak but publisher-attested);
+                         cached-file mismatch fails closed. Never reported as
+                         SHA-256-verified.
+    unresolved        -> refused unless allow_unverified is set (warning printed).
     """
     entry = get_artifact(artifact_id)
     source = entry["source"]
@@ -272,9 +298,15 @@ def download(
         )
 
     expected_hash: Optional[str] = None
+    hash_algorithm = "sha256"
     cached_hash_mismatch = "redownload"
+    md5 = entry.get("md5")
     if entry["status"] == STATUS_VERIFIED:
         expected_hash = entry["sha256"]
+        cached_hash_mismatch = "fail"
+    elif md5 is not None:
+        expected_hash = md5
+        hash_algorithm = "md5"
         cached_hash_mismatch = "fail"
     else:
         if not entry.get("allow_unverified"):
@@ -294,6 +326,7 @@ def download(
         model_dir=model_dir,
         file_name=file_name or entry["file_name"],
         expected_hash=expected_hash,
+        hash_algorithm=hash_algorithm,
         cached_hash_mismatch=cached_hash_mismatch,
         allowed_domains=entry.get("allowed_domains"),
         progress=progress,
