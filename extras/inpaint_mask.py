@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from extras.GroundingDINO.util.inference import default_groundingdino
 from extras.sam.predictor import SamPredictor
+from modules.rembg_preseed import ensure_rembg_model
 from rembg import remove, new_session
 from segment_anything import sam_model_registry
 from segment_anything.utils.amg import remove_small_regions
@@ -59,6 +60,11 @@ def generate_mask_from_image(image: np.ndarray, mask_model: str = 'sam', extras=
         image = image['image']
 
     if mask_model != 'sam' or sam_options is None:
+        # P1-B: pre-seed recognized rembg models through the hardened
+        # downloader before rembg's new_session() runs. Fail-closed for
+        # recognized models (errors propagate; no fallback to rembg's
+        # internal downloader); unrecognized names are left to rembg.
+        ensure_rembg_model(mask_model)
         result = remove(
             image,
             session=new_session(mask_model, **extras),

@@ -554,7 +554,9 @@ class TestManifestSchemaCorrections(ManifestTestBase):
 
     def test_l3_real_manifest_file_names_still_valid(self):
         manifest = load_manifest(refresh=True)
-        self.assertEqual(len(manifest["artifacts"]), 40)
+        # 39 since P1-B retired the orphaned deit-base-patch16 entry
+        # (its only call site, blip_pretrain.py, was deleted).
+        self.assertEqual(len(manifest["artifacts"]), 39)
 
 
 class TestRealManifestAndWiring(unittest.TestCase):
@@ -567,11 +569,13 @@ class TestRealManifestAndWiring(unittest.TestCase):
 
     def test_manifest_entry_counts(self):
         artifacts = self.manifest["artifacts"]
-        self.assertEqual(len(artifacts), 40)
+        # 39 since P1-B retired the orphaned deit-base-patch16 entry
+        # (its only call site, blip_pretrain.py, was deleted).
+        self.assertEqual(len(artifacts), 39)
         verified = [a for a in artifacts if a["status"] == "verified"]
         unresolved = [a for a in artifacts if a["status"] == "unresolved"]
         self.assertEqual(len(verified), 26)
-        self.assertEqual(len(unresolved), 14)
+        self.assertEqual(len(unresolved), 13)
         self.assertEqual(
             self.manifest["user_supplied_categories"],
             [

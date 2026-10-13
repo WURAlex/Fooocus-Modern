@@ -37,4 +37,4 @@ jobs:
         run: python -m pip install --disable-pip-version-check packaging==24.1
 
       - name: Run security test suite
-        run: python -m unittest tests.test_model_loader tests.test_model_integrity tests.test_p1_legacy_migration tests.test_extra_utils -v
+        run: python -m unittest tests.test_model_loader tests.test_model_integrity tests.test_p1_legacy_migration tests.test_extra_utils tests.test_p1b_blip_rembg -v

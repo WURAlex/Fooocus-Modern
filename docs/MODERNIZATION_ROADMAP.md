@@ -742,8 +742,32 @@ stage has any evidence behind it.
     `utils.append_dims`) and **deleted in P1-A**. All four migrations can
     proceed **without downloading model weights** at the routing layer;
     full-hash tiers are approval-gated downloads. P1-A (facexlib routing,
-    helper deletion, tests, CI extension) is implemented and awaiting
-    review; BLIP/DeiT and rembg await separate approval.
+    helper deletion, tests, CI extension) **merged as PR #3**
+    (`182a863`, 2026-10-12; suite 202/202 ×3 after `tests.test_extra_utils`
+    was added to CI).
+    **P1-B approved items 1–3 implemented (2026-10-13, uncommitted on
+    `feature/stage7-blip-rembg`):** dead `extras/BLIP/models/blip_pretrain.py`
+    deleted (zero importers) and orphaned `deit-base-patch16` manifest entry
+    retired (provenance in `docs/MODEL_INTEGRITY_AUDIT.md` and the P1-B
+    audit §1/§9); manifest gained an optional `md5` schema field with
+    ambiguity rules (verified+md5 / sha256+md5 / md5+allow_unverified all
+    rejected) and the 7 `rembg-*` entries were completed with immutable
+    `v0.0.0` URLs, publisher-attested md5 pins, exact byte sizes, and
+    GitHub domain allowlists; new stdlib-only
+    `modules/rembg_preseed.py` pre-seeds recognized models into rembg's
+    own cache (`U2NET_HOME`/`XDG_DATA_HOME`/`~/.u2net` semantics preserved)
+    through the hardened downloader before `new_session()`, fail-closed
+    with no fallback and no rembg/pooch patching (pooch's md5 re-check
+    still runs; `modules/model_loader.py` untouched). New
+    `tests/test_p1b_blip_rembg.py` (46 offline tests) covers mappings,
+    schema, md5 mismatch, cache reuse/corruption, symlink/traversal,
+    env precedence, failure cleanup, BLIP captioning compatibility, and
+    guardrails; full suite **248/248 ×3 (3.10/3.12/3.14)**; actionlint
+    clean. Remaining (separate approval): Tier B sha256 rehash of the 7
+    files (~932 MB, upgrades entries to `verified` and drops `md5`), and
+    optional `blip.py load_checkpoint` local-only hardening.
+    See `docs/P1B_BLIP_REMBG_READINESS_AUDIT.md` §9 for the implementation
+    record, MD5 limitation disclosure, and recovery guidance.
 16. Stage 8: audit `modules/launch_util.py` subprocess execution, network call
     sites, and any residual update behavior.
 17. ~~Add a CI workflow~~ — Security CI exists since PR #1 (`tests.test_model_loader`
